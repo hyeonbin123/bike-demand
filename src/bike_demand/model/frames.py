@@ -56,20 +56,15 @@ def trend_windows(history: tuple[str, str]) -> tuple[tuple[str, str], tuple[str,
     return last, prior
 
 
-def _sql(window: Window, only_active_stations: bool) -> str:
-    rows_start, rows_end = window.rows
-    hist_start, hist_end = window.history
-    (last_start, last_end), (prior_start, prior_end) = trend_windows(window.history)
-    active_filter = (
-        f"""and g.station_id in (
-            select station_id from int_station_hour_grid
-            where hour_start >= '{rows_start}' and hour_start < '{rows_end}'
-            group by 1 having sum(rentals) > 0)"""
-        if only_active_stations
-        else ""
-    )
+def history_ctes(history: tuple[str, str]) -> str:
+    """history 기간으로 계산하는 CTE들(codes, district_codes, profile, trend 등).
+
+    학습·평가 행(_sql)과 서비스용 산출물(model/artifacts.py)이 같은 정의를 쓴다.
+    """
+    hist_start, hist_end = history
+    (last_start, last_end), (prior_start, prior_end) = trend_windows(history)
     return f"""
-with codes as (
+codes as (
     select station_id, row_number() over (order by station_id) - 1 as station_code,
            district, docks, lat, lon
     from dim_stations
@@ -117,6 +112,21 @@ global_trend as (
             as global_trend
     from history
 )
+"""
+
+
+def _sql(window: Window, only_active_stations: bool) -> str:
+    rows_start, rows_end = window.rows
+    active_filter = (
+        f"""and g.station_id in (
+            select station_id from int_station_hour_grid
+            where hour_start >= '{rows_start}' and hour_start < '{rows_end}'
+            group by 1 having sum(rentals) > 0)"""
+        if only_active_stations
+        else ""
+    )
+    return f"""
+with {history_ctes(window.history)}
 select
     g.rentals::float as rentals,
     epoch(g.hour_start)::bigint // 86400 as day_index,

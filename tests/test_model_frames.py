@@ -1,44 +1,8 @@
-import duckdb
 import numpy as np
 import pytest
 
 from bike_demand.model import frames
 from bike_demand.model.metrics import evaluate
-
-
-@pytest.fixture
-def con():
-    """작은 warehouse: 대여소 ST-1은 학습·평가 기간 모두, ST-2는 평가 기간에만 있다."""
-    db = duckdb.connect()
-    db.execute("""
-        create table dim_stations as
-        select * from (values ('ST-1', '강남구', 10, 37.5, 127.0),
-                              ('ST-2', '마포구', 12, 37.6, 126.9))
-            t(station_id, district, docks, lat, lon)
-    """)
-    db.execute("""
-        create table dim_hours as
-        select h as hour_start, hour(h) as hour_of_day, isodow(h) as day_of_week,
-               month(h) as month, dayofyear(h) as day_of_year,
-               false as is_holiday, isodow(h) >= 6 as is_offday,
-               10.0 as temp_c, 0.0 as rain_mm, 1.0 as wind_ms, 50.0 as humidity_pct,
-               0.0 as snow_cm
-        from unnest(generate_series(timestamp '2024-01-01', timestamp '2024-01-31 23:00:00',
-                                    interval 1 hour)) t(h)
-    """)
-    # 학습 기간(1/1~1/15)에는 ST-1이 8시마다 2대, 평가 기간(1/16~)에는 8시마다 100대
-    db.execute("""
-        create table int_station_hour_grid as
-        select 'ST-1' as station_id, hour_start,
-               case when hour(hour_start) = 8 and not is_offday
-                    then (case when hour_start < '2024-01-16' then 2 else 100 end) else 0 end
-                   as rentals
-        from dim_hours
-        union all
-        select 'ST-2', hour_start, case when hour(hour_start) = 8 then 5 else 0 end
-        from dim_hours where hour_start >= '2024-01-16'
-    """)
-    return db
 
 
 def test_trend_windows():
@@ -47,9 +11,9 @@ def test_trend_windows():
     assert prior == ("2023-07-01", "2024-01-01")
 
 
-def test_profile_uses_history_only_and_baselines_fall_back(con):
+def test_profile_uses_history_only_and_baselines_fall_back(small_warehouse):
     window = frames.Window(rows=("2024-01-16", "2024-02-01"), history=("2024-01-01", "2024-01-16"))
-    frame = frames.load_frame(con, window, only_active_stations=True)
+    frame = frames.load_frame(small_warehouse, window, only_active_stations=True)
     st1 = frame["station_code"] == 0
     weekday_8 = (frame["hour_of_day"] == 8) & (frame["is_offday"] == 0)
 
@@ -64,9 +28,9 @@ def test_profile_uses_history_only_and_baselines_fall_back(con):
     assert frame["rentals"][st1 & weekday_8].min() == 100
 
 
-def test_inactive_stations_are_dropped_from_evaluation(con):
+def test_inactive_stations_are_dropped_from_evaluation(small_warehouse):
     window = frames.Window(rows=("2024-01-01", "2024-01-16"), history=("2024-01-01", "2024-01-16"))
-    frame = frames.load_frame(con, window, only_active_stations=True)
+    frame = frames.load_frame(small_warehouse, window, only_active_stations=True)
     assert set(np.unique(frame["station_code"])) == {0.0}
 
 
