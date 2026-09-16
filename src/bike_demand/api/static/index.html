@@ -1,0 +1,100 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>따릉이 부족 예측 · bike-demand</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+        integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin="">
+  <link rel="stylesheet" href="/static/dashboard.css">
+  <script defer src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
+          integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
+  <script defer src="/static/dashboard.js"></script>
+</head>
+<body>
+  <a class="skip-link" href="#risk-table">대여소 목록으로 건너뛰기</a>
+  <header class="site-header">
+    <a class="brand" href="/" aria-label="bike-demand 홈"><span class="brand-symbol" aria-hidden="true">↗</span> bike-demand</a>
+    <span class="city-label">SEOUL <span aria-hidden="true">/</span> 서울 공공자전거</span>
+  </header>
+
+  <main>
+    <section class="intro" aria-labelledby="page-title">
+      <div>
+        <p class="eyebrow">따릉이 수요 모니터</p>
+        <h1 id="page-title">따릉이 부족 예측</h1>
+        <p class="description">현재 자전거 수와 예상 대여량으로, 곧 자전거가 부족해질 대여소를 살펴보세요.</p>
+      </div>
+      <div class="snapshot-info" role="status">
+        <span class="meta-label">마지막 수집 시각 · KST</span>
+        <strong id="snapshot-time">확인 중…</strong>
+        <span id="health-message" class="muted">스냅샷 시각을 확인하고 있습니다.</span>
+      </div>
+    </section>
+
+    <form id="filters" class="filters" aria-label="부족 예측 조회 조건">
+      <div class="field">
+        <label for="hours">예측 구간</label>
+        <select id="hours" name="hours">
+          <option value="1">앞으로 1시간</option><option value="2">앞으로 2시간</option>
+          <option value="3" selected>앞으로 3시간</option><option value="4">앞으로 4시간</option>
+          <option value="5">앞으로 5시간</option><option value="6">앞으로 6시간</option>
+        </select>
+      </div>
+      <div class="field">
+        <label for="district">자치구</label>
+        <select id="district" name="district" disabled><option value="">서울 전체</option></select>
+      </div>
+      <button id="refresh" class="primary-button" type="submit">새로고침 <span aria-hidden="true">↻</span></button>
+      <p class="filter-note">최근 30분 내 스냅샷 기준<br>부족 예상 대수 순 · 최대 500곳</p>
+      <p id="district-message" class="field-message" role="status"></p>
+    </form>
+
+    <aside class="notice"><span aria-hidden="true">ⓘ</span><p><strong id="risk-note">반납은 반영하지 않은 값</strong>입니다. 실제 품절 여부가 아닌, 반납이 없을 때 모자랄 수 있는 대수입니다.</p></aside>
+    <p id="risk-status" class="status-line" role="status" aria-live="polite">예측 정보를 불러오는 중입니다.</p>
+
+    <div class="workspace">
+      <section class="panel map-panel" aria-labelledby="map-title">
+        <div class="panel-heading"><h2 id="map-title">부족 예상 지도</h2><span id="map-count" class="muted">—</span></div>
+        <div id="map" aria-label="서울 대여소 부족 예측 지도. 같은 정보는 옆 대여소 표에서도 확인할 수 있습니다."></div>
+        <p id="map-message" class="map-message" role="status"></p>
+        <div class="map-legend" aria-label="원의 색과 크기는 부족 예상 대수를 나타냅니다">
+          <span class="meta-label">부족 예상</span>
+          <span><i class="legend-dot low" aria-hidden="true"></i>5대 미만</span>
+          <span><i class="legend-dot medium" aria-hidden="true"></i>5~10대 미만</span>
+          <span><i class="legend-dot high" aria-hidden="true"></i>10대 이상</span>
+        </div>
+      </section>
+
+      <section class="panel list-panel" aria-labelledby="list-title">
+        <div class="panel-heading"><h2 id="list-title">부족 예상 대여소</h2><span id="station-count" class="count-badge">—</span></div>
+        <div class="table-scroll" tabindex="0" role="region" aria-label="대여소 목록 스크롤">
+          <table id="risk-table" tabindex="-1">
+            <caption class="sr-only">부족 대수가 큰 순서입니다. 대여소 이름을 선택하면 시간별 예측을 확인할 수 있습니다.</caption>
+            <thead><tr><th scope="col">대여소</th><th scope="col">현재<br>자전거</th><th scope="col">예상<br>대여</th><th scope="col">부족<br>예상</th></tr></thead>
+            <tbody id="risk-rows"></tbody>
+          </table>
+          <p id="empty-message" class="empty-message">데이터를 불러오고 있습니다.</p>
+        </div>
+        <p class="table-footnote">단위: 대 · 대여소 이름을 눌러 시간별 예측 보기</p>
+      </section>
+    </div>
+
+    <section id="detail" class="panel detail-panel" aria-labelledby="detail-title" aria-busy="false">
+      <div class="detail-header">
+        <div><p class="eyebrow">대여소 자세히 보기</p><h2 id="detail-title" tabindex="-1">대여소를 선택하세요</h2></div>
+        <p id="detail-snapshot" class="muted"></p>
+      </div>
+      <p id="detail-status" role="status">지도 위 원이나 목록의 대여소를 선택하면 앞으로 6시간의 예측을 보여 드립니다.</p>
+      <ol id="forecast-bars" class="forecast-bars" aria-label="정시 기준 시간별 예상 대여 수"></ol>
+      <p id="detail-note" class="detail-note" hidden>막대는 정시부터 한 시간 동안의 예상 대여량입니다. 현재 시간이 포함된 첫 시간도 한 시간 전체 값이며, 부족 대수 계산에는 겹치는 시간만 비례 반영합니다.</p>
+      <p id="detail-version" class="version"></p>
+    </section>
+    <p id="risk-version" class="version"></p>
+  </main>
+
+  <footer>대여·대여소 정보: 서울 열린데이터광장 (공공누리 제1유형) <span aria-hidden="true">·</span> 날씨: 기상청 <span aria-hidden="true">·</span> 모든 시각은 한국 표준시(KST)</footer>
+  <noscript><p class="noscript">이 대시보드는 JavaScript를 켜야 지도와 예측 정보를 불러올 수 있습니다.</p></noscript>
+</body>
+</html>

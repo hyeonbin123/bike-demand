@@ -78,6 +78,17 @@ uv run uvicorn bike_demand.api.main:app --port 8000   # http://localhost:8000/do
 
 요청·응답 형식과 경계 규칙(어느 예측 버전을 쓰는지, 부분 시간 비례, 503과 빈 목록)은 [docs/api.md](docs/api.md).
 
+### 대시보드
+
+`uv run uvicorn bike_demand.api.main:app --host 127.0.0.1 --port 8000`으로 실행한 뒤
+<http://127.0.0.1:8000/>에서 확인한다. 별도 빌드 없이 API와 같은 서버가 HTML·JS·CSS를 제공한다.
+지도 도구(Leaflet CDN)와 OpenStreetMap 배경 타일을 불러오려면 인터넷 연결이 필요하다.
+
+1~6시간과 자치구를 고르면 부족 예상 대여소를 지도와 표에 최대 500곳까지 표시한다.
+대여소를 선택하면 현재 시간이 포함된 앞으로 6개 시간대의 예상 대여량을 볼 수 있다.
+좌표가 없는 대여소도 표에 남으며, 반납 미반영·데이터 없음·예측 누락을 화면에 표시한다.
+필터 변경 또는 새로고침 버튼으로 갱신하며, 마지막 수집 시각은 `/health`에서 가져온다.
+
 DAG는 처음에 멈춘 상태로 만들어지므로 웹 화면이나 `docker compose exec airflow-scheduler airflow dags unpause <dag_id>`로 켠다. 프로젝트 패키지는 Airflow 이미지 안의 별도 가상환경(`/opt/bike/.venv`)에 설치되어 Airflow 의존성과 섞이지 않는다. 멈추려면 `docker compose --profile airflow stop`.
 
 ## 데이터 준비

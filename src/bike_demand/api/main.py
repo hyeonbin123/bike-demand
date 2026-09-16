@@ -8,9 +8,12 @@ from __future__ import annotations
 
 from datetime import date, datetime, timedelta, timezone
 from functools import lru_cache
+from pathlib import Path
 from typing import Annotated
 
 from fastapi import Depends, FastAPI, HTTPException, Query
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from sqlalchemy import Engine, and_, func, select, text
 from sqlalchemy.exc import SQLAlchemyError
@@ -104,6 +107,14 @@ class Health(BaseModel):
 
 
 app = FastAPI(title="bike-demand", version="0.1.0")
+STATIC_DIR = Path(__file__).with_name("static")
+app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+
+
+@app.get("/", response_class=FileResponse, include_in_schema=False)
+def dashboard() -> FileResponse:
+    return FileResponse(STATIC_DIR / "index.html")
+
 
 STATION_COLUMNS = (
     Station.station_id,
