@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import calendar
 import os
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import httpx
@@ -41,20 +41,34 @@ def collect_realtime(
     now: datetime | None = None,
     client: httpx.Client | None = None,
 ) -> dict:
+    """수집 → 그날 Parquet 재생성 → 적재. 0시대에 돌면 전날도 다시 만들고 적재한다.
+
+    23:59대에 수집은 됐지만 적재가 실패하고, 재시도가 자정을 넘기면 그 스냅샷은 전날 폴더에만
+    남는다(T35). 적재는 이미 있는 행을 건너뛰므로 전날을 다시 적재해도 중복되지 않는다.
+    """
     collected_at = realtime._kst(now or datetime.now(realtime.KST))
     day = collected_at.date()
     path, status = realtime.download(raw_dir, service_key, collected_at, client=client)
-    parquet = bronze_dir / f"date={day:%Y-%m-%d}" / "snapshots.parquet"
-    rows = realtime.to_parquet(raw_dir, parquet, day)
-    snapshots, stations = load.load_realtime(engine, bronze_dir, day)
-    return {
-        "day": day.isoformat(),
-        "raw": str(path),
-        "status": status,
-        "parquet_rows": rows,
-        "snapshots_inserted": snapshots,
-        "new_stations": stations,
-    }
+    days = [day - timedelta(days=1), day] if collected_at.hour == 0 else [day]
+    result: dict = {"day": day.isoformat(), "raw": str(path), "status": status, "days": {}}
+    for target in days:
+        if not (raw_dir / f"date={target:%Y-%m-%d}").exists():
+            continue
+        parquet = bronze_dir / f"date={target:%Y-%m-%d}" / "snapshots.parquet"
+        rows = realtime.to_parquet(raw_dir, parquet, target)
+        snapshots, stations = load.load_realtime(engine, bronze_dir, target)
+        result["days"][target.isoformat()] = {
+            "parquet_rows": rows,
+            "snapshots_inserted": snapshots,
+            "new_stations": stations,
+        }
+    today = result["days"][day.isoformat()]
+    result.update(
+        parquet_rows=today["parquet_rows"],
+        snapshots_inserted=sum(d["snapshots_inserted"] for d in result["days"].values()),
+        new_stations=sum(d["new_stations"] for d in result["days"].values()),
+    )
+    return result
 
 
 if __name__ == "__main__":

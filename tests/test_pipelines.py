@@ -52,3 +52,42 @@ def test_latest_trip_month_and_last_day(tmp_path):
     assert latest_trip_month(raw) == "2026-12"
     assert last_day("2026-12") == "2026-12-31"
     assert last_day("2028-02") == "2028-02-29"
+
+
+def test_retry_after_midnight_recovers_the_previous_day(pg_engine, tmp_path, monkeypatch):
+    """23:59:59 수집 성공 → 적재 실패 → 00:02 재시도에서 전날 스냅샷도 적재된다(T35)."""
+    from bike_demand.serving import load
+
+    raw, bronze = tmp_path / "raw", tmp_path / "bronze"
+    client = httpx.Client(transport=httpx.MockTransport(bike_list))
+    real_load = load.load_realtime
+    calls = []
+    failures = [RuntimeError("DB 잠깐 끊김")]
+
+    def flaky_load(engine, bronze_dir, day):
+        calls.append(day)
+        if failures:
+            raise failures.pop()
+        return real_load(engine, bronze_dir, day)
+
+    monkeypatch.setattr(load, "load_realtime", flaky_load)
+    before = datetime(2026, 9, 16, 23, 59, 59, tzinfo=realtime.KST)
+    after = datetime(2026, 9, 17, 0, 2, tzinfo=realtime.KST)
+    try:
+        collect_realtime(pg_engine, raw, bronze, SECRET, before, client)
+    except RuntimeError:
+        pass
+    result = collect_realtime(pg_engine, raw, bronze, SECRET, after, client)
+
+    assert calls == [date(2026, 9, 16), date(2026, 9, 16), date(2026, 9, 17)]
+    assert result["days"]["2026-09-16"]["snapshots_inserted"] == 2
+    assert result["days"]["2026-09-17"]["snapshots_inserted"] == 2
+    with pg_engine.connect() as conn:
+        count = conn.execute(select(func.count()).select_from(RealtimeSnapshot)).scalar_one()
+    assert count == 4
+
+    # 한 시간 뒤(1시대)에는 전날을 다시 건드리지 않는다
+    calls.clear()
+    one_am = datetime(2026, 9, 17, 1, 0, tzinfo=realtime.KST)
+    collect_realtime(pg_engine, raw, bronze, SECRET, one_am, client)
+    assert calls == [date(2026, 9, 17)]
