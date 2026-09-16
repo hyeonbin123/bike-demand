@@ -25,3 +25,6 @@ dbt/.user.yml
 # Local-only collaboration files
 ROLES.md
 TASKS.md
+
+# Airflow
+airflow/logs/

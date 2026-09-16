@@ -40,6 +40,8 @@ select = ["E", "F", "I", "B", "UP"]
 [tool.ruff.lint.isort]
 # alembic/ 폴더(마이그레이션)가 있어 패키지 alembic을 내부 모듈로 잘못 분류하지 않게 함
 known-third-party = ["alembic"]
+# airflow/dags의 공통 모듈(Airflow가 dags 폴더를 import 경로에 넣음)
+known-first-party = ["bike_demand", "bike_common"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

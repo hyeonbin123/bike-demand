@@ -7,7 +7,7 @@ from typing import Any
 
 from sqlalchemy import Engine, create_engine
 
-DEFAULT_DATABASE_URL = "postgresql+psycopg://bike:bike@localhost:55452/bike_demand"
+DEFAULT_DATABASE_URL = "postgresql+psycopg://bike:bike@127.0.0.1:55452/bike_demand"
 
 
 def database_url() -> str:

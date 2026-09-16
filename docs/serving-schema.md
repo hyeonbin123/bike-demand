@@ -10,7 +10,7 @@ uv run python -m bike_demand.serving.load realtime --day 2026-09-16
 uv run python -m bike_demand.serving.load forecasts
 ```
 
-접속 문자열은 환경 변수 `DATABASE_URL`, 없으면 `postgresql+psycopg://bike:bike@localhost:55452/bike_demand`.
+접속 문자열은 환경 변수 `DATABASE_URL`, 없으면 `postgresql+psycopg://bike:bike@127.0.0.1:55452/bike_demand`.
 
 ## 시간대
 모든 시각은 `timestamptz`. 애플리케이션 연결은 세션 시간대를 `Asia/Seoul`로 열어 +09:00으로 읽는다. 적재할 때 들어오는 문자열은 모두 오프셋이 붙은 ISO 8601이다.

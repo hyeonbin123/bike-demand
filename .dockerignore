@@ -1,0 +1,10 @@
+data/
+work/
+.venv/
+.git/
+airflow/logs/
+**/__pycache__/
+.env
+.env.*
+dbt/target/
+dbt/logs/

@@ -1,5 +1,45 @@
-# 서비스용 PostgreSQL. 원본·정제 데이터는 data/(Parquet, DuckDB)에 있고 여기에는 서비스에 필요한 것만 둔다.
-# 호스트 포트 55452: Windows가 5432 부근을 예약하는 경우가 있고 다른 프로젝트가 55432·55442를 씀.
+# 서비스용 PostgreSQL과 Airflow.
+# - `docker compose up -d db`: 서비스 DB만 (호스트 포트 55452. Windows가 5432 부근을 예약하는 경우가 있고
+#   다른 프로젝트가 55432·55442를 씀)
+# - `docker compose --profile airflow up -d`: Airflow까지 (웹 화면 http://localhost:58080)
+# 원본·정제 데이터는 data/(Parquet, DuckDB)에 있고 Postgres에는 서비스에 필요한 것만 둔다.
+
+x-airflow-common: &airflow-common
+  build:
+    context: .
+    dockerfile: airflow/Dockerfile
+  image: bike-demand-airflow:local
+  profiles: ["airflow"]
+  env_file:
+    - path: .env
+      required: false
+  environment: &airflow-env
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@airflow-db/airflow
+    AIRFLOW__CORE__EXECUTION_API_SERVER_URL: http://airflow-apiserver:8080/execution/
+    AIRFLOW__API_AUTH__JWT_SECRET: ${AIRFLOW_JWT_SECRET:-local-dev-only-jwt-secret}
+    AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "true"
+    AIRFLOW__CORE__DEFAULT_TIMEZONE: Asia/Seoul
+    # 로컬 개발용: 로그인 없이 모두 관리자. 외부에 열지 않는다(포트는 localhost에만 묶음)
+    AIRFLOW__CORE__SIMPLE_AUTH_MANAGER_ALL_ADMINS: "true"
+    AIRFLOW__SCHEDULER__ENABLE_HEALTH_CHECK: "true"
+    # 프로젝트 명령이 쓰는 값. 서비스 DB는 컨테이너 네트워크 안의 db로 접속한다
+    DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-bike}:${POSTGRES_PASSWORD:-bike}@db:5432/${POSTGRES_DB:-bike_demand}
+    TZ: Asia/Seoul
+  volumes:
+    - ./airflow/dags:/opt/airflow/dags
+    - ./airflow/logs:/opt/airflow/logs
+    - ./data:/opt/bike/data
+    - ./src:/opt/bike/src
+    - ./dbt:/opt/bike/dbt
+  user: "50000:0"
+  depends_on: &airflow-depends
+    airflow-db:
+      condition: service_healthy
+    db:
+      condition: service_healthy
+
 services:
   db:
     image: postgres:16
@@ -8,7 +48,7 @@ services:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-bike}
       POSTGRES_DB: ${POSTGRES_DB:-bike_demand}
     ports:
-      - "${POSTGRES_PORT:-55452}:5432"
+      - "127.0.0.1:${POSTGRES_PORT:-55452}:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
@@ -17,5 +57,61 @@ services:
       timeout: 3s
       retries: 20
 
+  airflow-db:
+    image: postgres:16
+    profiles: ["airflow"]
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+    volumes:
+      - airflow-pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U airflow -d airflow"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  airflow-init:
+    <<: *airflow-common
+    command: ["bash", "-c", "airflow db migrate && airflow version"]
+    restart: "no"
+
+  airflow-apiserver:
+    <<: *airflow-common
+    command: api-server
+    ports:
+      - "127.0.0.1:58080:8080"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/api/v2/monitor/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+    depends_on:
+      <<: *airflow-depends
+      airflow-init:
+        condition: service_completed_successfully
+
+  airflow-scheduler:
+    <<: *airflow-common
+    command: scheduler
+    restart: unless-stopped
+    depends_on:
+      <<: *airflow-depends
+      airflow-init:
+        condition: service_completed_successfully
+
+  airflow-dag-processor:
+    <<: *airflow-common
+    command: dag-processor
+    restart: unless-stopped
+    depends_on:
+      <<: *airflow-depends
+      airflow-init:
+        condition: service_completed_successfully
+
 volumes:
   pgdata:
+  airflow-pgdata:
