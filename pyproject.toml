@@ -5,6 +5,7 @@ requires-python = ">=3.11"
 dependencies = [
     "dbt-duckdb>=1.11.0",
     "duckdb>=1.5.5",
+    "holidays>=0.104",
     "httpx>=0.28.1",
     "openpyxl>=3.1.5",
     "pyarrow>=25.0.1",

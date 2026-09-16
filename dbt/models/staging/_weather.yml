@@ -1,0 +1,11 @@
+version: 2
+
+models:
+  - name: stg_weather_hourly
+    description: "ASOS 서울 시간 관측. hour_start = 관측 시각 - 1시간 (강수량이 직전 1시간 누적이라서)"
+    columns:
+      - name: hour_start
+        data_tests: [unique, not_null]
+      - name: rain_mm
+        description: "비가 안 온 시간(원본 빈 값)은 0"
+        data_tests: [not_null]

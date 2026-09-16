@@ -12,3 +12,7 @@ sources:
         description: "대여소 정보 반기 스냅샷 (bike_demand.ingest.stations)"
         config:
           external_location: "read_parquet('{{ var('data_dir') }}/bronze/stations/stations.parquet')"
+      - name: asos_hourly
+        description: "기상청 ASOS 서울(108) 시간 관측 (bike_demand.ingest.weather)"
+        config:
+          external_location: "read_parquet('{{ var('data_dir') }}/bronze/weather/asos_hourly.parquet')"

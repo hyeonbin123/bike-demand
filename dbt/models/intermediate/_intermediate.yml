@@ -1,0 +1,45 @@
+version: 2
+
+models:
+  - name: dim_hours
+    description: "시간별 달력(요일, 공휴일, 쉬는 날)과 관측 날씨"
+    columns:
+      - name: hour_start
+        data_tests: [unique, not_null]
+      - name: temp_c
+        description: "관측이 빠진 시간은 빈 값. 마지막 시간(2026-06-30 23시)은 다음 날 0시 관측이 없어 항상 빔"
+        data_tests:
+          - not_null:
+              config:
+                severity: warn
+
+  - name: int_station_hour_grid
+    description: "대여소 × 시간 격자(0건 포함). 운영 기간(첫·마지막 대여/반납 날)만, 반납 전용 대여소 제외"
+    data_tests:
+      - unique:
+          column_name: "station_id || '|' || hour_start"
+    columns:
+      - name: station_id
+        data_tests: [not_null]
+      - name: rentals
+        data_tests: [not_null]
+
+unit_tests:
+  - name: grid_fills_zero_hours_within_active_days
+    model: int_station_hour_grid
+    given:
+      - input: ref('fct_station_hourly')
+        rows:
+          - {station_id: ST-1, hour_start: "2025-01-01 08:00:00", rentals: 2, returns: 0}
+          - {station_id: ST-1, hour_start: "2025-01-02 09:00:00", rentals: 0, returns: 1}
+          - {station_id: ST-9, hour_start: "2025-01-01 10:00:00", rentals: 0, returns: 3}
+      - input: ref('dim_stations')
+        rows:
+          - {station_id: ST-1, total_rentals: 2}
+          - {station_id: ST-9, total_rentals: 0}
+    expect:
+      format: sql
+      rows: |
+        select 'ST-1' as station_id, h as hour_start,
+               case when h = timestamp '2025-01-01 08:00:00' then 2 else 0 end as rentals
+        from unnest(generate_series(timestamp '2025-01-01 00:00:00', timestamp '2025-01-02 23:00:00', interval 1 hour)) as t(h)

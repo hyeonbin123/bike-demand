@@ -17,3 +17,10 @@ models:
       +materialized: view
     marts:
       +materialized: table
+
+seeds:
+  bike_demand:
+    kr_holidays:
+      +column_types:
+        holiday_date: date
+        holiday_name: varchar
