@@ -1,0 +1,21 @@
+# 서비스용 PostgreSQL. 원본·정제 데이터는 data/(Parquet, DuckDB)에 있고 여기에는 서비스에 필요한 것만 둔다.
+# 호스트 포트 55452: Windows가 5432 부근을 예약하는 경우가 있고 다른 프로젝트가 55432·55442를 씀.
+services:
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-bike}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-bike}
+      POSTGRES_DB: ${POSTGRES_DB:-bike_demand}
+    ports:
+      - "${POSTGRES_PORT:-55452}:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+volumes:
+  pgdata:
