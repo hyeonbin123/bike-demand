@@ -203,3 +203,43 @@ def test_download_skips_existing_and_incomplete_then_parquet(tmp_path):
     assert row["temp_c"] == "1.5"
     assert row["rain_mm"] is None  # 빈 문자열 -> null
     assert row["snow_cm"] is None  # 응답에 없는 필드
+
+
+def test_key_hidden_by_json_unicode_escape_is_rejected(tmp_path, monkeypatch):
+    """원문 검사로는 안 보이는 유니코드 이스케이프 키도 해석 뒤 검사해 저장하지 않는다(T25)."""
+    monkeypatch.setattr(weather.time, "sleep", lambda _: None)
+    escaped = "".join(chr(92) + f"u{ord(c):04x}" for c in SECRET)
+    item = '{"tm": "2023-01-01 01:00", "stnId": "108", "ta": "' + escaped + '"}'
+    body = (
+        '{"response": {"header": {"resultCode": "00"}, "body": {"totalCount": 1, '
+        '"items": {"item": [' + item + "]}}}}"
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, text=body, headers={"content-type": "application/json"})
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    raw = tmp_path / "raw"
+    assert SECRET not in body
+    with pytest.raises(weather.ApiError, match="반사") as info:
+        list(weather.download(raw, ["2023-01"], SECRET, date(2023, 2, 10), client))
+    assert SECRET not in str(info.value)
+    assert not weather.raw_path(raw, "2023-01").exists()
+
+
+def test_total_count_changing_between_pages_is_retried_then_fails(tmp_path, monkeypatch):
+    """1쪽은 전체 2건이라 하고 2쪽은 0건이라 하면 부분 달을 저장하지 않는다(T26)."""
+    monkeypatch.setattr(weather, "PAGE_SIZE", 1)
+    monkeypatch.setattr(weather.time, "sleep", lambda _: None)
+    items = hourly_items("2023-01", 2)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.params["pageNo"] == "1":
+            return httpx.Response(200, json=ok_body(items[:1], total=2))
+        return httpx.Response(200, json=ok_body([], total=0))
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    raw = tmp_path / "raw"
+    with pytest.raises(weather.ApiError, match="전체 건수가 쪽마다 다름"):
+        list(weather.download(raw, ["2023-01"], SECRET, date(2023, 2, 10), client))
+    assert not weather.raw_path(raw, "2023-01").exists()

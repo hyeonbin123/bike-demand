@@ -68,6 +68,9 @@ def _parse_page(response: httpx.Response, service_key: str) -> tuple[list[dict],
         auth, reason = _XML_AUTH_MSG.search(text), _XML_REASON.search(text)
         detail = " ".join(m.group(1) for m in (auth, reason) if m) or "형식 알 수 없음"
         raise ApiError(f"JSON이 아닌 응답 (HTTP {response.status_code}): {detail}") from None
+    # 원문에서 안 보여도(유니코드 이스케이프 등) 해석한 값에 키가 들어 있을 수 있다(T25)
+    if reflects_secret(json.dumps(payload, ensure_ascii=False), service_key):
+        raise ApiError(f"인증키가 반사된 응답 (HTTP {response.status_code})")
     if not isinstance(payload, dict) or not isinstance(payload.get("response"), dict):
         raise ApiError("응답 구조 오류")
     header = payload["response"].get("header")
@@ -94,13 +97,19 @@ def _get_page(
     retries: int,
     label: str,
     received: int,
+    first_total: int | None = None,
 ) -> tuple[list[dict], int]:
-    """한 쪽을 받는다. 앞서 받은 수(received)로 이 쪽에 와야 할 개수를 확인해 다르면 다시 받는다."""
+    """한 쪽을 받는다. 앞서 받은 수(received)로 이 쪽에 와야 할 개수를 확인해 다르면 다시 받는다.
+
+    first_total: 첫 쪽이 알린 전체 건수. 뒤쪽이 다른 값을 알리면 다시 받는다(T26).
+    """
     for attempt in range(1, retries + 1):
         try:
             with private_request():
                 response = client.get(ENDPOINT, params=params)
             items, total = _parse_page(response, params["serviceKey"])
+            if first_total is not None and total != first_total:
+                raise ApiError(f"전체 건수가 쪽마다 다름 ({first_total} -> {total})")
             expected = max(0, min(PAGE_SIZE, total - received))
             if len(items) != expected:
                 raise ApiError(f"항목 {len(items)}개, 전체 건수로 보면 {expected}개여야 함")
@@ -137,10 +146,17 @@ def fetch_month(
     }
     items: list[dict] = []
     page = 1
+    first_total: int | None = None
     while True:
         page_items, total = _get_page(
-            client, {**params, "pageNo": str(page)}, retries, f"{month} {page}쪽", len(items)
+            client,
+            {**params, "pageNo": str(page)},
+            retries,
+            f"{month} {page}쪽",
+            len(items),
+            first_total,
         )
+        first_total = total if first_total is None else first_total
         items.extend(page_items)
         if len(items) >= total:
             break
