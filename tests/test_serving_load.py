@@ -124,10 +124,10 @@ def test_migration_round_trip(pg_engine, revision):
 
 def test_temporary_database_is_dropped_when_migration_fails(pg_engine):
     """pg_engine이 쓰는 임시 DB 도구가 마이그레이션 실패에도 DB를 지우는지(T30)."""
+    from conftest import temporary_database
     from sqlalchemy.engine import make_url
 
     from bike_demand.serving.db import database_url
-    from tests.conftest import temporary_database
 
     def failing_upgrade(config, revision):
         created.append(make_url(config.get_main_option("sqlalchemy.url")).database)
