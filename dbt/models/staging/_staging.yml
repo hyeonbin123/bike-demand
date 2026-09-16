@@ -11,7 +11,8 @@ models:
       - name: duration_min
         data_tests: [not_null]
       - name: is_cancelled
-        description: "이용시간 0분 이하이고 빌린 대여소에 반납"
+        description: "이용시간 0분이고 빌린 대여소에 반납. 반납 대여소가 비면 false"
+        data_tests: [not_null]
 
   - name: stg_stations
     description: "대여소 정보 반기 스냅샷"
@@ -25,3 +26,27 @@ models:
         data_tests: [not_null]
       - name: lon
         data_tests: [not_null]
+
+unit_tests:
+  - name: stg_trips_dedupes_and_flags_cancelled_rentals
+    description: "완전히 같은 기록은 하나만, 0분+같은 대여소만 취소, 반납 대여소가 비면 취소 아님"
+    model: stg_trips
+    given:
+      - input: source('bronze', 'trips')
+        format: sql
+        rows: |
+          select 'B1' as bike_no, '2025-01-01 08:10:00' as rented_at, '00001' as rent_station_no, null::varchar as rent_station_name, null::varchar as rent_dock, '2025-01-01 08:20:00' as returned_at, '00002' as return_station_no, null::varchar as return_station_name, null::varchar as return_dock, '10' as duration_min, '900.00' as distance_m, null::varchar as birth_year, null::varchar as gender, null::varchar as user_type, 'ST-1' as rent_station_id, 'ST-2' as return_station_id, null::varchar as bike_type, null::varchar as source_file, '2025-01' as month
+          union all
+          select 'B1' as bike_no, '2025-01-01 08:10:00' as rented_at, '00001' as rent_station_no, null::varchar as rent_station_name, null::varchar as rent_dock, '2025-01-01 08:20:00' as returned_at, '00002' as return_station_no, null::varchar as return_station_name, null::varchar as return_dock, '10' as duration_min, '900.00' as distance_m, null::varchar as birth_year, null::varchar as gender, null::varchar as user_type, 'ST-1' as rent_station_id, 'ST-2' as return_station_id, null::varchar as bike_type, null::varchar as source_file, '2025-01' as month
+          union all
+          select 'B2' as bike_no, '2025-01-01 09:00:00' as rented_at, '00001' as rent_station_no, null::varchar as rent_station_name, null::varchar as rent_dock, '2025-01-01 09:00:30' as returned_at, '00001' as return_station_no, null::varchar as return_station_name, null::varchar as return_dock, '0' as duration_min, '0.00' as distance_m, null::varchar as birth_year, null::varchar as gender, null::varchar as user_type, 'ST-1' as rent_station_id, 'ST-1' as return_station_id, null::varchar as bike_type, null::varchar as source_file, '2025-01' as month
+          union all
+          select 'B3' as bike_no, '2025-01-01 09:05:00' as rented_at, '00001' as rent_station_no, null::varchar as rent_station_name, null::varchar as rent_dock, '2025-01-01 09:05:50' as returned_at, '00002' as return_station_no, null::varchar as return_station_name, null::varchar as return_dock, '0' as duration_min, '80.00' as distance_m, null::varchar as birth_year, null::varchar as gender, null::varchar as user_type, 'ST-1' as rent_station_id, 'ST-2' as return_station_id, null::varchar as bike_type, null::varchar as source_file, '2025-01' as month
+          union all
+          select 'B4' as bike_no, '2025-01-01 23:59:30' as rented_at, '00001' as rent_station_no, null::varchar as rent_station_name, null::varchar as rent_dock, '2025-01-02 00:00:10' as returned_at, null::varchar as return_station_no, null::varchar as return_station_name, null::varchar as return_dock, '0' as duration_min, '0.00' as distance_m, null::varchar as birth_year, null::varchar as gender, null::varchar as user_type, 'ST-1' as rent_station_id, null::varchar as return_station_id, null::varchar as bike_type, null::varchar as source_file, '2025-01' as month
+    expect:
+      rows:
+        - {bike_no: B1, is_cancelled: false}
+        - {bike_no: B2, is_cancelled: true}
+        - {bike_no: B3, is_cancelled: false}
+        - {bike_no: B4, is_cancelled: false}

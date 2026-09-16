@@ -37,6 +37,6 @@ deduplicated as (
 
 select
     *,
-    duration_min <= 0
-        and rent_station_id = return_station_id as is_cancelled
+    -- 반납 대여소가 빈 행은 비교 결과가 NULL이 되어 `not is_cancelled` 필터에서 빠지므로 false로 둔다.
+    coalesce(duration_min = 0 and rent_station_id = return_station_id, false) as is_cancelled
 from deduplicated

@@ -30,3 +30,21 @@ models:
           - not_null:
               config:
                 severity: warn
+
+unit_tests:
+  - name: fct_station_hourly_counts_by_hour
+    description: "정시 단위 [h, h+1) 집계, 취소 제외, 반납 대여소 없는 기록은 대여에만"
+    model: fct_station_hourly
+    given:
+      - input: ref('stg_trips')
+        rows:
+          - {rent_station_id: ST-1, rented_at: "2025-01-01 08:00:00", return_station_id: ST-2, returned_at: "2025-01-01 08:59:59", is_cancelled: false}
+          - {rent_station_id: ST-1, rented_at: "2025-01-01 08:59:59", return_station_id: ST-2, returned_at: "2025-01-01 09:00:00", is_cancelled: false}
+          - {rent_station_id: ST-1, rented_at: "2025-01-01 08:30:00", return_station_id: ST-1, returned_at: "2025-01-01 08:30:20", is_cancelled: true}
+          - {rent_station_id: ST-1, rented_at: "2025-01-01 23:59:30", return_station_id: null, returned_at: "2025-01-02 00:00:10", is_cancelled: false}
+    expect:
+      rows:
+        - {station_id: ST-1, hour_start: "2025-01-01 08:00:00", rentals: 2, returns: 0}
+        - {station_id: ST-2, hour_start: "2025-01-01 08:00:00", rentals: 0, returns: 1}
+        - {station_id: ST-2, hour_start: "2025-01-01 09:00:00", rentals: 0, returns: 1}
+        - {station_id: ST-1, hour_start: "2025-01-01 23:00:00", rentals: 1, returns: 0}
