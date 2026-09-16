@@ -18,14 +18,14 @@ models:
         data_tests: [not_null]
 
   - name: dim_stations
-    description: "대여소. 대여이력에 나온 곳 전부"
+    description: "대여소. 대여이력의 대여·반납에 나온 곳 전부"
     columns:
       - name: station_id
         data_tests: [unique, not_null]
       - name: station_no
         data_tests: [unique, not_null]
       - name: lat
-        description: "대여소 정보에 없는 5곳은 빈 값"
+        description: "대여소 정보에 없는 곳은 빈 값"
         data_tests:
           - not_null:
               config:

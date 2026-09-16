@@ -8,5 +8,4 @@ bike_demand:
       settings:
         threads: 10
         memory_limit: 16GB
-        temp_directory: "{{ env_var('BIKE_DEMAND_DATA_DIR', 'data') }}/warehouse/tmp"
         preserve_insertion_order: false

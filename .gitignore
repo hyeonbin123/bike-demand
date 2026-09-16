@@ -21,3 +21,7 @@ dbt/target/
 dbt/logs/
 dbt/dbt_packages/
 dbt/.user.yml
+
+# Local-only collaboration files
+ROLES.md
+TASKS.md
