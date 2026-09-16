@@ -169,6 +169,11 @@ def test_daily_predictions_pick_version_within_the_day(client, pg_engine):
     assert today["hours"][0]["hour_start"] == "2026-09-17T00:00:00+09:00"
     later = client.get("/predictions/ST-1", params={"date": "2026-09-18"}).json()
     assert later["model_version"] == "v2-new"
+    # 18일 새 버전에는 ST-2가 없다: 옛 버전으로 채우지 않고 새 버전 + 빈 목록(T34)
+    other = client.get("/predictions/ST-2", params={"date": "2026-09-18"}).json()
+    assert other["model_version"] == "v2-new" and other["hours"] == []
+    none_that_day = client.get("/predictions/ST-1", params={"date": "2026-10-01"}).json()
+    assert none_that_day["model_version"] is None and none_that_day["hours"] == []
     assert client.get("/predictions/ST-1", params={"date": "2026-10-01"}).json()["hours"] == []
     assert client.get("/predictions/ST-404", params={"date": "2026-09-17"}).status_code == 404
     assert client.get("/predictions/ST-1").status_code == 422

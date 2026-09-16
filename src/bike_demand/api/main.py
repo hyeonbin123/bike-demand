@@ -339,17 +339,18 @@ def daily_predictions(
         ).scalar_one_or_none()
         if exists is None:
             raise HTTPException(404, "station not found")
-        in_day = and_(
-            Prediction.station_id == station_id,
-            Prediction.hour_start >= start,
-            Prediction.hour_start < end,
-        )
+        # 버전은 대여소와 상관없이 그날 행이 있는 버전 중에서 고른다(docs/api.md, T34)
+        in_day = and_(Prediction.hour_start >= start, Prediction.hour_start < end)
         version = latest_version(conn, in_day)
         rows = []
         if version is not None:
             rows = conn.execute(
                 select(Prediction.hour_start, Prediction.predicted_rentals)
-                .where(in_day, Prediction.model_version == version)
+                .where(
+                    in_day,
+                    Prediction.model_version == version,
+                    Prediction.station_id == station_id,
+                )
                 .order_by(Prediction.hour_start)
             ).all()
     return DailyPredictions(
