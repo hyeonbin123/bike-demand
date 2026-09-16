@@ -3,6 +3,7 @@ name = "bike-demand"
 version = "0.1.0"
 requires-python = ">=3.11"
 dependencies = [
+    "alembic>=1.20.0",
     "dbt-duckdb>=1.11.0",
     "duckdb>=1.5.5",
     "holidays>=0.104",
@@ -10,8 +11,10 @@ dependencies = [
     "lightgbm>=4.7.0",
     "numpy>=2.4.6",
     "openpyxl>=3.1.5",
+    "psycopg[binary]>=3.2",
     "pyarrow>=25.0.1",
     "python-dotenv>=1.2.3",
+    "sqlalchemy>=2.0",
 ]
 
 [dependency-groups]
@@ -33,6 +36,10 @@ target-version = "py311"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "B", "UP"]
+
+[tool.ruff.lint.isort]
+# alembic/ 폴더(마이그레이션)가 있어 패키지 alembic을 내부 모듈로 잘못 분류하지 않게 함
+known-third-party = ["alembic"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
