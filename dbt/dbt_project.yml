@@ -1,0 +1,19 @@
+name: bike_demand
+version: "0.1.0"
+profile: bike_demand
+config-version: 2
+
+# 저장소 루트에서 실행한다: uv run dbt build --project-dir dbt --profiles-dir dbt
+model-paths: ["models"]
+test-paths: ["tests"]
+macro-paths: ["macros"]
+
+vars:
+  data_dir: "data"
+
+models:
+  bike_demand:
+    staging:
+      +materialized: view
+    marts:
+      +materialized: table

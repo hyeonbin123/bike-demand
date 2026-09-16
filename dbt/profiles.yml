@@ -1,0 +1,12 @@
+bike_demand:
+  target: dev
+  outputs:
+    dev:
+      type: duckdb
+      path: "{{ env_var('BIKE_DEMAND_DATA_DIR', 'data') }}/warehouse/bike_demand.duckdb"
+      threads: 1
+      settings:
+        threads: 10
+        memory_limit: 16GB
+        temp_directory: "{{ env_var('BIKE_DEMAND_DATA_DIR', 'data') }}/warehouse/tmp"
+        preserve_insertion_order: false

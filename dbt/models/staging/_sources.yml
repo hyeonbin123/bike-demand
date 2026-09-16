@@ -1,0 +1,14 @@
+version: 2
+
+sources:
+  - name: bronze
+    description: "ingest 모듈이 원본을 옮긴 Parquet. 모든 값이 문자열이다."
+    tables:
+      - name: trips
+        description: "따릉이 대여이력, 월별 파일 (bike_demand.ingest.trips)"
+        config:
+          external_location: "read_parquet('{{ var('data_dir') }}/bronze/trips/*/trips.parquet', hive_partitioning = true)"
+      - name: stations
+        description: "대여소 정보 반기 스냅샷 (bike_demand.ingest.stations)"
+        config:
+          external_location: "read_parquet('{{ var('data_dir') }}/bronze/stations/stations.parquet')"

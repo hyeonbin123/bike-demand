@@ -1,0 +1,32 @@
+version: 2
+
+models:
+  - name: fct_station_hourly
+    description: "대여소별 시간당 대여·반납 수 (0건인 시간은 행이 없음)"
+    data_tests:
+      - unique:
+          column_name: "station_id || '|' || hour_start"
+    columns:
+      - name: station_id
+        data_tests:
+          - not_null
+          - relationships:
+              arguments:
+                to: ref('dim_stations')
+                field: station_id
+      - name: hour_start
+        data_tests: [not_null]
+
+  - name: dim_stations
+    description: "대여소. 대여이력에 나온 곳 전부"
+    columns:
+      - name: station_id
+        data_tests: [unique, not_null]
+      - name: station_no
+        data_tests: [unique, not_null]
+      - name: lat
+        description: "대여소 정보에 없는 5곳은 빈 값"
+        data_tests:
+          - not_null:
+              config:
+                severity: warn

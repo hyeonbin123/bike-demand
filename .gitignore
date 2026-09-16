@@ -1,0 +1,23 @@
+work/
+data/
+.venv/
+__pycache__/
+*.pyc
+.env
+.env.*
+!.env.example
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+.DS_Store
+
+# Local-only coding-agent working files (collaboration rules and handoff notes)
+AGENTS.md
+CLAUDE.md
+HANDOFF.md
+
+# dbt
+dbt/target/
+dbt/logs/
+dbt/dbt_packages/
+dbt/.user.yml
