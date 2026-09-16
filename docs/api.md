@@ -1,0 +1,95 @@
+# API 계약
+
+FastAPI 서비스(`src/bike_demand/api/`)가 지키는 요청·응답 형식. 데이터는 서비스용 PostgreSQL(`docs/serving-schema.md`)에서만 읽는다. 이 문서를 바꾸면 구현과 테스트도 함께 바꾼다.
+
+## 공통
+- 시각은 모두 KST ISO 8601 문자열(`2026-09-17T08:00:00+09:00`)
+- 오류 응답 형식은 FastAPI 기본 `{"detail": ...}`
+  - 404: 없는 대여소
+  - 422: 요청 값 형식·범위 오류
+  - 503: 판단에 필요한 최신 데이터가 없음(`detail`에 무엇이 없는지)
+- 인증 없음(읽기 전용 공개 데이터)
+
+## `GET /health`
+```json
+{"status": "ok", "database": "ok", "latest_snapshot_at": "2026-09-17T08:10:03+09:00", "latest_prediction_hour": "2026-09-17T23:00:00+09:00"}
+```
+- DB에 접속하지 못하면 503 `{"detail": "database unavailable"}`
+- 스냅샷·예측이 하나도 없으면 해당 값은 `null`(상태는 `ok`)
+
+## `GET /stations`
+쿼리: `district`(선택, 자치구 이름 정확히 일치)
+
+```json
+[
+  {"station_id": "ST-1121", "station_no": 1653, "station_name": "노원역1번출구", "district": "노원구",
+   "lat": 37.655, "lon": 127.061, "docks": 15}
+]
+```
+- `station_id` 순서. 좌표를 모르는 대여소는 `lat`·`lon`이 `null`
+
+## `GET /stations/{station_id}`
+대여소 정보 + 가장 최근 스냅샷 + 지금 시각부터 앞으로 6시간의 시간별 예측.
+
+```json
+{
+  "station": {"station_id": "ST-1121", "station_no": 1653, "station_name": "노원역1번출구", "district": "노원구",
+              "lat": 37.655, "lon": 127.061, "docks": 15},
+  "snapshot": {"fetched_at": "2026-09-17T08:10:03+09:00", "bike_count": 4, "rack_count": 15},
+  "predictions": [
+    {"hour_start": "2026-09-17T08:00:00+09:00", "predicted_rentals": 3.2},
+    {"hour_start": "2026-09-17T09:00:00+09:00", "predicted_rentals": 1.9}
+  ],
+  "model_version": "v1-..."
+}
+```
+- `snapshot`: 없으면 `null`
+- `predictions`: 현재 시각이 든 시간부터 6개. 가장 최근 `model_version`의 값만. 없으면 빈 목록, `model_version`은 `null`
+
+## `GET /shortage-risk`
+곧 자전거가 부족해질 대여소 목록. 서비스의 핵심 응답.
+
+쿼리
+| 이름 | 기본 | 범위 | 뜻 |
+|---|---|---|---|
+| `hours` | 3 | 1~6 | 앞으로 몇 시간을 볼지 |
+| `limit` | 50 | 1~500 | 최대 몇 곳 |
+| `district` | 없음 | | 자치구 필터 |
+| `max_snapshot_age_minutes` | 30 | 1~180 | 이보다 오래된 스냅샷을 가진 대여소는 뺌 |
+
+계산 (대여소마다)
+- `as_of` = 그 대여소의 가장 최근 스냅샷 시각 (`max_snapshot_age_minutes` 안쪽인 것만)
+- 보는 구간 = [`as_of`, `as_of` + `hours`시간)
+- `expected_rentals` = 구간과 겹치는 시간별 예측의 합. 구간에 일부만 걸친 시간은 **겹친 분의 비율만큼** 곱한다 (예: `as_of` 08:20, `hours`=3 → 08시 예측 × 40/60 + 09시 + 10시 + 11시 × 20/60)
+- `bike_count` = 그 스냅샷의 자전거 수
+- `shortfall` = `expected_rentals` − `bike_count`
+- 반납은 예측하지 않으므로 이 값은 "반납이 없을 때 모자랄 수 있는 대수"다. 응답과 화면 설명에 이 한계를 적는다
+- 필요한 시간의 예측이 하나라도 없는 대여소는 뺀다
+
+정렬·필터: `shortfall > 0`인 대여소만, `shortfall` 큰 순, 같으면 `station_id` 순.
+
+```json
+{
+  "hours": 3,
+  "model_version": "v1-...",
+  "generated_at": "2026-09-17T08:12:00+09:00",
+  "note": "반납은 반영하지 않은 값",
+  "stations": [
+    {"station_id": "ST-1121", "station_name": "노원역1번출구", "district": "노원구", "lat": 37.655, "lon": 127.061,
+     "as_of": "2026-09-17T08:10:03+09:00", "bike_count": 1, "expected_rentals": 6.4, "shortfall": 5.4}
+  ]
+}
+```
+- 스냅샷이 기준 안에 하나도 없으면 503 `{"detail": "no recent snapshot"}`
+- 예측이 하나도 없으면 503 `{"detail": "no predictions"}`
+- 숫자는 소수 첫째 자리로 반올림해서 돌려준다(계산은 반올림 전 값으로)
+
+## `GET /predictions/{station_id}`
+쿼리: `date`(필수, `YYYY-MM-DD`, KST 날짜)
+
+```json
+{"station_id": "ST-1121", "date": "2026-09-17", "model_version": "v1-...",
+ "hours": [{"hour_start": "2026-09-17T00:00:00+09:00", "predicted_rentals": 0.1}]}
+```
+- 그날 예측이 있는 가장 최근 `model_version`의 24시간(없는 시간은 목록에서 빠짐)
+- 없는 대여소 404, 그날 예측이 없으면 `hours`가 빈 목록
