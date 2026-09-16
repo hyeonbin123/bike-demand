@@ -32,6 +32,8 @@ FEATURES = [
     "global_trend",
 ]
 CATEGORICAL = ["station_code", "district_code"]
+# v2: 행의 시각에 이미 공개돼 있던 가장 최근 반기로 계산한 수준 (docs/experiments.md v2)
+LEVEL_FEATURES = ["station_recent_mean", "station_recent_ratio", "system_recent_ratio"]
 
 
 @dataclass(frozen=True)
@@ -115,7 +117,35 @@ global_trend as (
 """
 
 
-def _sql(window: Window, only_active_stations: bool) -> str:
+# 반기 번호 = (연*12 + 월-1) // 6. 행이 속한 달 번호 n에서 1개월 이상 전에 끝난 가장 최근 반기는
+# (n - 7) // 6 이다 (반기 h는 달 [6h, 6h+6)을 덮고, 6h+6 <= n-1 이어야 함).
+LEVEL_CTES = """
+halves as (
+    select station_id, (year(hour_start) * 12 + month(hour_start) - 1) // 6 as half,
+           avg(rentals) as half_mean, sum(rentals) as half_sum
+    from int_station_hour_grid group by all
+),
+system_halves as (
+    select half, sum(half_sum) as total from halves group by 1
+),
+"""
+
+LEVEL_SELECT = """,
+    lh.half_mean::float as station_recent_mean,
+    (lh.half_mean / nullif(lp.half_mean, 0))::float as station_recent_ratio,
+    (sh.total / nullif(sp.total, 0))::float as system_recent_ratio"""
+
+LEVEL_JOINS = """
+left join halves as lh
+    on lh.station_id = g.station_id
+    and lh.half = (year(g.hour_start) * 12 + month(g.hour_start) - 1 - 7) // 6
+left join halves as lp on lp.station_id = g.station_id and lp.half = lh.half - 2
+left join system_halves as sh
+    on sh.half = (year(g.hour_start) * 12 + month(g.hour_start) - 1 - 7) // 6
+left join system_halves as sp on sp.half = sh.half - 2"""
+
+
+def _sql(window: Window, only_active_stations: bool, with_levels: bool = False) -> str:
     rows_start, rows_end = window.rows
     active_filter = (
         f"""and g.station_id in (
@@ -126,7 +156,7 @@ def _sql(window: Window, only_active_stations: bool) -> str:
         else ""
     )
     return f"""
-with {history_ctes(window.history)}
+with {LEVEL_CTES if with_levels else ""}{history_ctes(window.history)}
 select
     g.rentals::float as rentals,
     epoch(g.hour_start)::bigint // 86400 as day_index,
@@ -151,7 +181,7 @@ select
     t.station_trend::float as station_trend,
     (select global_trend from global_trend)::float as global_trend,
     coalesce(p.profile_mean, gp.global_profile_mean)::float as b0,
-    coalesce(hp.hour_mean, gh.global_hour_mean)::float as b1
+    coalesce(hp.hour_mean, gh.global_hour_mean)::float as b1{LEVEL_SELECT if with_levels else ""}
 from int_station_hour_grid as g
 join dim_hours as h using (hour_start)
 join codes as c using (station_id)
@@ -163,17 +193,23 @@ left join trend as t on t.station_id = g.station_id
 left join hour_profile as hp
     on hp.station_id = g.station_id and hp.hour_of_day = h.hour_of_day
 left join global_profile as gp on gp.is_offday = h.is_offday and gp.hour_of_day = h.hour_of_day
-left join global_hour as gh on gh.hour_of_day = h.hour_of_day
+left join global_hour as gh on gh.hour_of_day = h.hour_of_day{LEVEL_JOINS if with_levels else ""}
 where g.hour_start >= '{rows_start}' and g.hour_start < '{rows_end}'
 {active_filter}
 """
 
 
 def load_frame(
-    con: duckdb.DuckDBPyConnection, window: Window, only_active_stations: bool
+    con: duckdb.DuckDBPyConnection,
+    window: Window,
+    only_active_stations: bool,
+    with_levels: bool = False,
 ) -> dict[str, np.ndarray]:
-    """열 이름 → numpy 배열. float32(특징·목표), day_index는 int64."""
-    arrays = con.execute(_sql(window, only_active_stations)).fetchnumpy()
+    """열 이름 → numpy 배열. float32(특징·목표), day_index는 int64.
+
+    with_levels: LEVEL_FEATURES(v2)도 만든다. 격자 전체에서 행보다 앞선 반기만 읽는다.
+    """
+    arrays = con.execute(_sql(window, only_active_stations, with_levels)).fetchnumpy()
     out: dict[str, np.ndarray] = {}
     for name in arrays:
         column = arrays[name]
