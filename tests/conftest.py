@@ -63,7 +63,7 @@ def small_warehouse():
                month(h) as month, dayofyear(h) as day_of_year,
                false as is_holiday, isodow(h) >= 6 as is_offday,
                10.0 as temp_c, 0.0 as rain_mm, 1.0 as wind_ms, 50.0 as humidity_pct,
-               0.0 as snow_cm
+               false as is_new_snow
         from unnest(generate_series(timestamp '2024-01-01', timestamp '2024-01-31 23:00:00',
                                     interval 1 hour)) t(h)
     """)
@@ -97,7 +97,7 @@ def two_year_warehouse():
                month(h) as month, dayofyear(h) as day_of_year,
                false as is_holiday, isodow(h) >= 6 as is_offday,
                10.0 as temp_c, 0.0 as rain_mm, 1.0 as wind_ms, 50.0 as humidity_pct,
-               0.0 as snow_cm
+               false as is_new_snow
         from unnest(generate_series(timestamp '2023-01-01', timestamp '2025-06-30 23:00:00',
                                     interval 1 hour)) t(h)
     """)

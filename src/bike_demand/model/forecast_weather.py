@@ -12,6 +12,9 @@
 | humidity_pct | REH (%) | 숫자 |
 | is_snow | SNO (1시간 신적설) | 적설없음이면 0, 그 밖에 0보다 크면 1 |
 
+학습 쪽 `is_snow`는 ASOS 3시간 신적설 > 0(`stg_weather_hourly.is_new_snow`)이다.
+둘 다 "새로 내린 눈"이라 뜻이 같다(쌓인 눈 깊이가 아님, T24).
+
 해석할 수 없는 값은 결측(NaN)으로 두고, LightGBM이 결측으로 처리한다.
 """
 

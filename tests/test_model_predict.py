@@ -22,7 +22,7 @@ def test_serving_features_match_training_features(small_warehouse, tmp_path):
     training = frames.feature_matrix(frame, frames.FEATURES)
 
     hours_table = small_warehouse.execute(
-        """select hour_start, temp_c, rain_mm, wind_ms, humidity_pct, (snow_cm > 0)::int
+        """select hour_start, temp_c, rain_mm, wind_ms, humidity_pct, is_new_snow::int
            from dim_hours where hour_start >= '2024-01-16' and hour_start < '2024-01-18'
            order by hour_start"""
     ).fetchall()

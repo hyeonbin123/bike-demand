@@ -35,7 +35,8 @@ select
     w.rain_mm,
     w.wind_ms,
     w.humidity_pct,
-    w.snow_cm
+    w.is_new_snow,
+    w.snow_depth_cm
 from hours as h
 left join holidays as hol on cast(h.hour_start as date) = hol.holiday_date
 left join {{ ref('stg_weather_hourly') }} as w using (hour_start)

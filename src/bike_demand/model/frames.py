@@ -222,7 +222,7 @@ select
     h.rain_mm::float as rain_mm,
     h.wind_ms::float as wind_ms,
     h.humidity_pct::float as humidity_pct,
-    (h.snow_cm > 0)::int::float as is_snow,
+    h.is_new_snow::int::float as is_snow,
     p.profile_mean::float as profile_mean,
     t.station_trend::float as station_trend,
     (select global_trend from global_trend)::float as global_trend,

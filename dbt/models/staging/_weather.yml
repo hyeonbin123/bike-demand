@@ -2,10 +2,38 @@ version: 2
 
 models:
   - name: stg_weather_hourly
-    description: "ASOS 서울 시간 관측. hour_start = 관측 시각 - 1시간 (강수량이 직전 1시간 누적이라서)"
+    description: "ASOS 서울 관측을 대여 시간에 맞춘 값. 겨울 강수는 3시간 누적을 1/3씩, 눈은 3시간 신적설 여부"
     columns:
       - name: hour_start
         data_tests: [unique, not_null]
       - name: rain_mm
-        description: "비가 안 온 시간(원본 빈 값)은 0"
+        description: "그 한 시간의 강수(겨울은 3시간 누적의 1/3). 비가 안 오면 0"
         data_tests: [not_null]
+      - name: rain_mm_reported
+        description: "그 시각에 보고된 원래 값(겨울 비보고 시각은 0)"
+      - name: is_new_snow
+        description: "이 시간을 덮는 3시간 신적설이 0보다 큼"
+        data_tests: [not_null]
+
+unit_tests:
+  - name: weather_spreads_winter_rain_and_marks_new_snow
+    model: stg_weather_hourly
+    given:
+      - input: source('bronze', 'asos_hourly')
+        format: sql
+        rows: |
+          select * from (values
+            -- 1월: 03시에만 3시간 누적 0.9, 신적설 0.3. 01·02시 보고는 빈 값
+            ('2024-01-09 01:00', '108', '-1.0', null, '1.0', null, '80', null, null, null, '0.5', null, null, null, null),
+            ('2024-01-09 02:00', '108', '-1.0', null, '1.0', null, '80', null, null, null, '0.6', null, null, null, null),
+            ('2024-01-09 03:00', '108', '-1.0', '0.9', '1.0', null, '80', null, null, null, '0.8', '0.3', null, null, null),
+            -- 7월: 매시 1시간 누적
+            ('2024-07-01 13:00', '108', '25.0', '2.0', '1.0', null, '90', null, null, null, null, null, null, null, null)
+          ) t(observed_at, station_id, temp_c, rain_mm, wind_ms, wind_dir_deg, humidity_pct, dew_point_c,
+              pressure_hpa, sunshine_hr, snow_cm, new_snow_3h_cm, cloud_total, visibility_10m, ground_temp_c)
+    expect:
+      rows:
+        - {hour_start: "2024-01-09 00:00:00", rain_mm: 0.3, rain_mm_reported: 0.0, is_new_snow: true}
+        - {hour_start: "2024-01-09 01:00:00", rain_mm: 0.3, rain_mm_reported: 0.0, is_new_snow: true}
+        - {hour_start: "2024-01-09 02:00:00", rain_mm: 0.3, rain_mm_reported: 0.9, is_new_snow: true}
+        - {hour_start: "2024-07-01 12:00:00", rain_mm: 2.0, rain_mm_reported: 2.0, is_new_snow: false}
