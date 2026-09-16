@@ -40,3 +40,15 @@ def test_snapshot_taken_just_before_midnight_is_loaded_under_its_own_day(pg_engi
     with pg_engine.connect() as conn:
         fetched = conn.execute(select(func.max(RealtimeSnapshot.fetched_at))).scalar_one()
     assert fetched.astimezone(realtime.KST).date() == date(2026, 9, 16)
+
+
+def test_latest_trip_month_and_last_day(tmp_path):
+    from bike_demand.pipelines import last_day, latest_trip_month
+
+    raw = tmp_path / "trips"
+    raw.mkdir()
+    for name in ("대여이력_2606.csv", "대여이력_2612.csv", "대여이력_2609.csv"):
+        (raw / name).write_bytes(b"")
+    assert latest_trip_month(raw) == "2026-12"
+    assert last_day("2026-12") == "2026-12-31"
+    assert last_day("2028-02") == "2028-02-29"
