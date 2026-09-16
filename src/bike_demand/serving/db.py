@@ -19,6 +19,7 @@ def make_engine(url: str | None = None, **kwargs: Any) -> Engine:
     return create_engine(
         url or database_url(),
         pool_pre_ping=True,
-        connect_args={"options": "-c timezone=Asia/Seoul"},
+        # DB가 죽었을 때 요청이 운영체제 기본 제한(수십 초 이상)까지 멈추지 않게 한다
+        connect_args={"options": "-c timezone=Asia/Seoul", "connect_timeout": 5},
         **kwargs,
     )

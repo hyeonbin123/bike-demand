@@ -12,7 +12,7 @@
 | 2. 날씨 결합 | 기상청 ASOS 서울(108) 시간 관측값(기온, 강수, 풍속, 습도)을 시간 단위로 결합 | 완료 |
 | 3. 실시간 수집 | 실시간 대여정보(대여소별 현재 자전거 수)를 10분마다, 단기예보를 발표마다 저장 (Airflow) | 동작 중 |
 | 4. 예측 | LightGBM 하나로 전체 대여소의 시간별 대여 수 예측. 시간 순서로 나눠 검증(학습 2023~2024, validation 2025 상반기, test 2025 하반기~2026 상반기). test MAE 1.044, 대여소×요일구분×시간 평균 기준선 1.185 ([측정 기록](docs/experiments.md)) | 완료 |
-| 5. 서비스 | 예상 대여 수 > 현재 자전거 수인 대여소를 FastAPI와 대시보드로 표시 | 예정 |
+| 5. 서비스 | 예상 대여 수 > 현재 자전거 수인 대여소를 FastAPI와 대시보드로 표시 | API 완료, 대시보드 예정 |
 | 6. 추가 측정 | 학습은 관측 날씨, 실제 예측은 예보 날씨로 하게 되는 차이가 정확도를 얼마나 떨어뜨리는지 | 예정 |
 
 ## 구조
@@ -61,6 +61,22 @@ docker compose --profile airflow up -d --build          # Airflow 웹 화면 htt
 | `collect_realtime` | 10분마다 | 따릉이 실시간 대여정보 → 원본 JSON·Parquet → `realtime_snapshots` |
 | `forecast_and_predict` | 02·05·…·23시 15분 | 단기예보 → `weather_forecasts` → 앞으로 48시간 예측 `predictions` |
 | `refresh_history` | 수동 | 새 반기 원본 변환 → ASOS → dbt build → 대여소 갱신 |
+
+### API
+
+```bash
+uv run uvicorn bike_demand.api.main:app --port 8000   # http://localhost:8000/docs
+```
+
+| 요청 | 응답 |
+|---|---|
+| `GET /health` | DB 상태, 마지막 스냅샷 시각, 마지막 예측 시간 |
+| `GET /stations?district=` | 대여소 목록 |
+| `GET /stations/{station_id}` | 대여소 정보, 최근 스냅샷, 앞으로 6시간 예측 |
+| `GET /shortage-risk?hours=3&limit=50&district=` | 앞으로 N시간 예상 대여가 지금 자전거 수보다 많은 대여소(부족 대수 순). 반납은 반영하지 않음 |
+| `GET /predictions/{station_id}?date=YYYY-MM-DD` | 하루 시간별 예측 |
+
+요청·응답 형식과 경계 규칙(어느 예측 버전을 쓰는지, 부분 시간 비례, 503과 빈 목록)은 [docs/api.md](docs/api.md).
 
 DAG는 처음에 멈춘 상태로 만들어지므로 웹 화면이나 `docker compose exec airflow-scheduler airflow dags unpause <dag_id>`로 켠다. 프로젝트 패키지는 Airflow 이미지 안의 별도 가상환경(`/opt/bike/.venv`)에 설치되어 Airflow 의존성과 섞이지 않는다. 멈추려면 `docker compose --profile airflow stop`.
 
