@@ -51,7 +51,11 @@ class WeatherForecast(Base):
 
 class Prediction(Base):
     __tablename__ = "predictions"
-    __table_args__ = (Index("ix_predictions_hour_start", "hour_start"),)
+    __table_args__ = (
+        Index("ix_predictions_hour_start", "hour_start"),
+        Index("ix_predictions_created_at_version", "created_at", "model_version"),
+        Index("ix_predictions_version_hour", "model_version", "hour_start"),
+    )
 
     station_id: Mapped[str] = mapped_column(String(20), primary_key=True)
     hour_start: Mapped[datetime] = mapped_column(DateTime(timezone=True), primary_key=True)
