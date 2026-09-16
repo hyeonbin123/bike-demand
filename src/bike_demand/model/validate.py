@@ -14,6 +14,7 @@ from __future__ import annotations
 import gc
 import json
 import time
+from collections.abc import Callable
 from pathlib import Path
 
 import duckdb
@@ -107,6 +108,66 @@ def fit_lightgbm(
     booster = lgb.train(PARAMS, full_set, num_boost_round=best)
     log["refit_seconds"] = round(time.perf_counter() - started, 1)
     del full_set, matrix
+    gc.collect()
+    return booster, best
+
+
+def fit_lightgbm_separate_stop(
+    load_stop_frame: Callable[[], dict[str, np.ndarray]],
+    load_full_frame: Callable[[], dict[str, np.ndarray]],
+    features: list[str],
+    log: dict,
+    early_stop_from: str,
+) -> tuple[lgb.Booster, int]:
+    """v3(T25): 조기 종료 단계와 최종 학습에 서로 다른 특징 행을 쓴다.
+
+    load_stop_frame은 대여소 패턴·추세를 early_stop_from 이전 기간만으로 계산한 학습 기간 행이다.
+    그래야 조기 종료 구간의 대여가 조기 종료 판단에 쓰이는 특징에 섞이지 않는다. 두 행 묶음을
+    동시에 메모리에 두지 않도록 차례로 불러온다.
+    """
+    categorical = [f for f in features if f in CATEGORICAL]
+    started = time.perf_counter()
+    stop_frame = load_stop_frame()
+    split = stop_frame["day_index"] < _day_index(early_stop_from)
+    matrix = feature_matrix(stop_frame, features)
+    rentals = stop_frame["rentals"]
+    del stop_frame
+    gc.collect()
+    fit_set = lgb.Dataset(
+        matrix[split], rentals[split], feature_name=features,
+        categorical_feature=categorical, free_raw_data=True,
+    )  # fmt: skip
+    stop_set = lgb.Dataset(matrix[~split], rentals[~split], reference=fit_set, free_raw_data=True)
+    probe = lgb.train(
+        PARAMS,
+        fit_set,
+        num_boost_round=MAX_ROUNDS,
+        valid_sets=[stop_set],
+        callbacks=[
+            lgb.early_stopping(EARLY_STOPPING_ROUNDS, verbose=False),
+            lgb.log_evaluation(100),
+        ],
+    )
+    best = probe.best_iteration
+    log["early_stopping_seconds"] = round(time.perf_counter() - started, 1)
+    log["best_iteration"] = best
+    log["early_stopping_l1"] = probe.best_score["valid_0"]["l1"]
+    del probe, fit_set, stop_set, matrix, rentals
+    gc.collect()
+
+    started = time.perf_counter()
+    full_frame = load_full_frame()
+    matrix = feature_matrix(full_frame, features)
+    rentals = full_frame["rentals"]
+    del full_frame
+    gc.collect()
+    full_set = lgb.Dataset(
+        matrix, rentals, feature_name=features, categorical_feature=categorical,
+        free_raw_data=True,
+    )  # fmt: skip
+    booster = lgb.train(PARAMS, full_set, num_boost_round=best)
+    log["refit_seconds"] = round(time.perf_counter() - started, 1)
+    del full_set, matrix, rentals
     gc.collect()
     return booster, best
 

@@ -53,9 +53,9 @@ def small_warehouse():
     db = duckdb.connect()
     db.execute("""
         create table dim_stations as
-        select * from (values ('ST-1', '강남구', 10, 37.5, 127.0),
-                              ('ST-2', '마포구', 12, 37.6, 126.9))
-            t(station_id, district, docks, lat, lon)
+        select * from (values ('ST-1', 1, '강남구', 10, 37.5, 127.0),
+                              ('ST-2', 2, '마포구', 12, 37.6, 126.9))
+            t(station_id, station_no, district, docks, lat, lon)
     """)
     db.execute("""
         create table dim_hours as
@@ -88,7 +88,8 @@ def two_year_warehouse():
     db = duckdb.connect()
     db.execute("""
         create table dim_stations as
-        select 'ST-1' as station_id, '강남구' as district, 10 as docks, 37.5 as lat, 127.0 as lon
+        select 'ST-1' as station_id, 1 as station_no, '강남구' as district, 10 as docks,
+               37.5 as lat, 127.0 as lon
     """)
     db.execute("""
         create table dim_hours as

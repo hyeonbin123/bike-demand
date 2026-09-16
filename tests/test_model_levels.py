@@ -37,3 +37,38 @@ def test_levels_are_off_by_default(two_year_warehouse):
     window = frames.Window(rows=("2025-01-01", "2025-02-01"), history=("2023-01-01", "2025-01-01"))
     frame = frames.load_frame(two_year_warehouse, window, False)
     assert not set(frames.LEVEL_FEATURES) & set(frame)
+
+
+def test_asof_station_info_uses_only_earlier_snapshots(two_year_warehouse):
+    """대여소 정보 스냅샷: 22.12월 기준 거치대 10, 24.6월 기준 20(자치구 바뀜)."""
+    two_year_warehouse.execute("""
+        create table stg_stations as
+        select * from (values (1, '강남구', 10, 37.5, 127.0, '2022-12'),
+                              (1, '서초구', 20, 37.4, 127.1, '2024-06'))
+            t(station_no, district, docks, lat, lon, snapshot)
+    """)
+    window = frames.Window(rows=("2024-06-01", "2024-08-01"), history=("2023-01-01", "2024-06-01"))
+    frame = frames.load_frame(two_year_warehouse, window, False, asof_stations=True)
+    june = frame["day_index"] < np.datetime64("2024-07-01", "D").astype(int)
+
+    # 24.6월 기준 스냅샷은 6월 행에는 아직 쓰지 않고 7월 행부터 쓴다
+    assert set(frame["docks"][june]) == {10.0}
+    assert set(frame["docks"][~june]) == {20.0}
+    assert set(frame["lat"][~june]) == {np.float32(37.4)}
+    # 서초구는 코드 매기기(dim_stations 기준)에 없으므로 자치구 코드는 빈 값
+    assert np.isnan(frame["district_code"][~june]).all()
+    assert set(frame["district_code"][june]) == {0.0}
+
+    default = frames.load_frame(two_year_warehouse, window, False)
+    assert set(default["docks"]) == {10.0}  # 기본값은 dim_stations(여기서는 10) 그대로
+
+
+def test_asof_station_info_is_empty_before_any_snapshot(two_year_warehouse):
+    two_year_warehouse.execute("""
+        create table stg_stations as
+        select 1 as station_no, '강남구' as district, 10 as docks, 37.5 as lat, 127.0 as lon,
+               '2024-06' as snapshot
+    """)
+    window = frames.Window(rows=("2024-06-01", "2024-06-02"), history=("2023-01-01", "2024-06-01"))
+    frame = frames.load_frame(two_year_warehouse, window, False, asof_stations=True)
+    assert np.isnan(frame["docks"]).all() and np.isnan(frame["lat"]).all()

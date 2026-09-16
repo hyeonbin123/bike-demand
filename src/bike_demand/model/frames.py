@@ -68,7 +68,7 @@ def history_ctes(history: tuple[str, str]) -> str:
     return f"""
 codes as (
     select station_id, row_number() over (order by station_id) - 1 as station_code,
-           district, docks, lat, lon
+           station_no, district, docks, lat, lon
     from dim_stations
 ),
 district_codes as (
@@ -140,6 +140,32 @@ system_halves as (
 ),
 """
 
+# v3(T24): 행이 속한 달보다 앞선 달을 기준으로 한 가장 최근 대여소 정보 스냅샷의 정적 정보.
+# 대여소ID·자치구 코드 번호(codes, district_codes)는 그대로 쓴다.
+ASOF_STATION_CTES = """
+station_months as (
+    select c.station_id, m.month_key, s.district, s.docks, s.lat, s.lon
+    from codes as c
+    cross join (
+        select distinct year(hour_start) * 12 + month(hour_start) - 1 as month_key
+        from dim_hours
+    ) as m
+    asof left join (
+        select station_no, district, docks, lat, lon,
+               cast(left(snapshot, 4) as integer) * 12
+                   + cast(right(snapshot, 2) as integer) - 1 as snapshot_key
+        from stg_stations
+    ) as s
+        on s.station_no = c.station_no and m.month_key > s.snapshot_key
+),
+"""
+
+ASOF_STATION_JOINS = """
+left join station_months as sm
+    on sm.station_id = g.station_id
+    and sm.month_key = year(g.hour_start) * 12 + month(g.hour_start) - 1
+left join district_codes as sdc on sdc.district = sm.district"""
+
 LEVEL_SELECT = """,
     lh.half_mean::float as station_recent_mean,
     (lh.half_mean / nullif(lp.half_mean, 0))::float as station_recent_ratio,
@@ -155,8 +181,18 @@ left join system_halves as sh
 left join system_halves as sp on sp.half = sh.half - 2"""
 
 
-def _sql(window: Window, only_active_stations: bool, with_levels: bool = False) -> str:
+def _sql(
+    window: Window,
+    only_active_stations: bool,
+    with_levels: bool = False,
+    asof_stations: bool = False,
+) -> str:
     rows_start, rows_end = window.rows
+    static = ("sm", "sdc") if asof_stations else ("c", "dc")
+    extra_ctes = ("," + ASOF_STATION_CTES.rstrip().rstrip(",")) if asof_stations else ""
+    extra_joins = (LEVEL_JOINS if with_levels else "") + (
+        ASOF_STATION_JOINS if asof_stations else ""
+    )
     active_filter = (
         f"""and g.station_id in (
             select station_id from int_station_hour_grid
@@ -166,15 +202,15 @@ def _sql(window: Window, only_active_stations: bool, with_levels: bool = False) 
         else ""
     )
     return f"""
-with {LEVEL_CTES if with_levels else ""}{history_ctes(window.history)}
+with {LEVEL_CTES if with_levels else ""}{history_ctes(window.history)}{extra_ctes}
 select
     g.rentals::float as rentals,
     epoch(g.hour_start)::bigint // 86400 as day_index,
     c.station_code::float as station_code,
-    dc.district_code::float as district_code,
-    c.docks::float as docks,
-    c.lat::float as lat,
-    c.lon::float as lon,
+    {static[1]}.district_code::float as district_code,
+    {static[0]}.docks::float as docks,
+    {static[0]}.lat::float as lat,
+    {static[0]}.lon::float as lon,
     h.hour_of_day::float as hour_of_day,
     h.day_of_week::float as day_of_week,
     h.is_offday::int::float as is_offday,
@@ -203,7 +239,7 @@ left join trend as t on t.station_id = g.station_id
 left join hour_profile as hp
     on hp.station_id = g.station_id and hp.hour_of_day = h.hour_of_day
 left join global_profile as gp on gp.is_offday = h.is_offday and gp.hour_of_day = h.hour_of_day
-left join global_hour as gh on gh.hour_of_day = h.hour_of_day{LEVEL_JOINS if with_levels else ""}
+left join global_hour as gh on gh.hour_of_day = h.hour_of_day{extra_joins}
 where g.hour_start >= '{rows_start}' and g.hour_start < '{rows_end}'
 {active_filter}
 """
@@ -214,12 +250,15 @@ def load_frame(
     window: Window,
     only_active_stations: bool,
     with_levels: bool = False,
+    asof_stations: bool = False,
 ) -> dict[str, np.ndarray]:
     """열 이름 → numpy 배열. float32(특징·목표), day_index는 int64.
 
     with_levels: LEVEL_FEATURES(v2)도 만든다. 격자 전체에서 행보다 앞선 반기만 읽는다.
+    asof_stations: 거치대 수·좌표·자치구를 행보다 앞선 대여소 정보 스냅샷에서 가져온다(v3, T24).
     """
-    arrays = con.execute(_sql(window, only_active_stations, with_levels)).fetchnumpy()
+    sql = _sql(window, only_active_stations, with_levels, asof_stations)
+    arrays = con.execute(sql).fetchnumpy()
     out: dict[str, np.ndarray] = {}
     for name in arrays:
         column = arrays[name]
