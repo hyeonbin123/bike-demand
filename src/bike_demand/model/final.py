@@ -1,14 +1,14 @@
-"""v1 선택 뒤의 두 단계 (docs/experiments.md v1).
+"""측정에서 고른 후보로 test를 한 번 재고, 서비스용 모델 세대를 만든다 (docs/experiments.md).
 
-1. test: validation에서 고른 후보 하나를 train+validation(2023-01~2025-06)으로 다시 만들어
-   test(2025-07~2026-06)에서 **한 번만** 잰다. 결과 파일이 이미 있으면 다시 재지 않는다.
-   v2(validation_v2.json)에서 M3를 채택했으면 M3를 쓰고 결과는 test_v2.json에 남긴다
-   (test 기간을 두 번째로 보는 것이라 그렇게 표시한다).
-2. serving: 같은 후보를 전체 기간(2023-01~2026-06)으로 학습해 서비스 예측에 쓸 모델과
-   산출물(model/artifacts.py)을 저장한다.
+선택은 가장 최근 측정 버전을 따른다: validation_v3.json → validation_v2.json(M3 채택일 때) → v1.
 
-LightGBM 후보의 라운드 수는 validation 때와 같은 방식(학습 기간의 마지막 두 달로 조기 종료한 뒤
-전체 기간으로 다시 학습)으로 정한다.
+1. test: 고른 후보를 train+validation(2023-01~2025-06)으로 다시 만들어 test(2025-07~2026-06)에서
+   **한 번만** 잰다. 시작할 때 `<결과>.started` 예약 파일을 원자적으로 만들어 동시 실행과 중단 뒤
+   다시 재는 것을 막는다(T27). 중단됐으면 사람이 사정을 확인한 뒤 예약 파일을 지운다.
+   v2 결과는 test 기간을 두 번째로 본 것이라 그렇게 표시한다. v3는 계획대로 test를 재지 않는다.
+2. serving: 같은 후보를 전체 기간(2023-01~2026-06)으로 학습해 `serving/generations/<세대>/`에
+   모델·산출물·설명을 모두 쓴 뒤 `serving/CURRENT`(세대 이름 한 줄)를 원자적으로 바꾼다(T28).
+   예측 작업은 CURRENT를 한 번 읽고 그 세대의 파일만 쓴다.
 
 실행: uv run python -m bike_demand.model.final test | serving
 """
@@ -17,8 +17,9 @@ from __future__ import annotations
 
 import gc
 import json
-import shutil
+import os
 import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import duckdb
@@ -35,8 +36,9 @@ from bike_demand.model.frames import (
     shift_months,
 )
 from bike_demand.model.metrics import evaluate
-from bike_demand.model.validate import fit_lightgbm
+from bike_demand.model.validate import fit_lightgbm, fit_lightgbm_separate_stop
 
+KST = timezone(timedelta(hours=9))
 RETRAIN = ("2023-01-01", "2025-07-01")
 TEST = ("2025-07-01", "2026-07-01")
 SERVING = ("2023-01-01", "2026-07-01")
@@ -44,11 +46,16 @@ CANDIDATE_FEATURES = {
     "M1": FEATURES,
     "M2": [f for f in FEATURES if f not in WEATHER_FEATURES],
     "M3": [*FEATURES, *LEVEL_FEATURES],
+    "M1'": FEATURES,
+    "M3'": [*FEATURES, *LEVEL_FEATURES],
 }
 
 
 def selected_model(out_dir: Path) -> tuple[str, str]:
-    """(선택 ID, 측정 버전). v2에서 M3를 채택했으면 ("M3", "v2")."""
+    """(선택 ID, 측정 버전)."""
+    v3 = out_dir / "validation_v3.json"
+    if v3.exists():
+        return json.loads(v3.read_text("utf-8"))["selected"], "v3"
     v2 = out_dir / "validation_v2.json"
     if v2.exists() and json.loads(v2.read_text("utf-8"))["selected"] == "M3":
         return "M3", "v2"
@@ -56,12 +63,32 @@ def selected_model(out_dir: Path) -> tuple[str, str]:
     return report["selected"], "v1"
 
 
+def _uses_levels(selected: str) -> bool:
+    return selected.startswith("M3")
+
+
+def reserve_once(path: Path) -> None:
+    """path가 없을 때만 원자적으로 만든다. 이미 있으면 SystemExit."""
+    try:
+        fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    except FileExistsError:
+        raise SystemExit(
+            f"이미 시작된 test 실행이 있음: {path}. 중단된 실행이면 확인 후 이 파일을 지운다"
+        ) from None
+    with os.fdopen(fd, "w", encoding="utf-8") as stream:
+        stream.write(f"started {datetime.now(KST).isoformat()} pid {os.getpid()}\n")
+
+
 def run_test(warehouse: Path, out_dir: Path) -> dict:
     selected, version = selected_model(out_dir)
+    if version == "v3":
+        raise SystemExit("v3는 계획대로 test를 재지 않는다(test 기간을 이미 두 번 봄)")
     result_path = out_dir / ("test.json" if version == "v1" else f"test_{version}.json")
     if result_path.exists():
         raise SystemExit(f"test는 한 번만 잰다: {result_path}가 이미 있음")
-    levels = selected == "M3"
+    reserve_once(result_path.with_suffix(".started"))
+
+    levels = _uses_levels(selected)
     report: dict = {"selected": selected, "version": version, "train": RETRAIN, "test": TEST}
     if version != "v1":
         report["note"] = "test 기간을 두 번째로 본 결과(v1에서 M1으로 한 번 봄)"
@@ -92,55 +119,101 @@ def run_test(warehouse: Path, out_dir: Path) -> dict:
     return report
 
 
+# --- 서비스 모델 세대 (T28, T29) ---------------------------------------------------------
+
+
+def generation_name(version: str, selected: str, now: datetime) -> str:
+    """예: v3-M3p-20260917T0412. model_version 앞부분으로도 쓴다(T29)."""
+    model = selected.replace("'", "p")
+    return f"{version}-{model}-{now.astimezone(KST):%Y%m%dT%H%M}"
+
+
+def publish_generation(serving_root: Path, generation: str) -> None:
+    """CURRENT를 임시 파일에 쓰고 os.replace로 바꾼다. 읽는 쪽은 옛 이름이나 새 이름만 본다."""
+    tmp = serving_root / f"CURRENT.{os.getpid()}.tmp"
+    tmp.write_text(generation + "\n", encoding="utf-8")
+    os.replace(tmp, serving_root / "CURRENT")
+
+
+def current_generation(serving_root: Path) -> tuple[str, Path]:
+    """(세대 이름, 세대 폴더). CURRENT가 없고 예전 구조(serving/model.txt)면 그 폴더를 쓴다."""
+    pointer = serving_root / "CURRENT"
+    if pointer.exists():
+        name = pointer.read_text(encoding="utf-8").strip()
+        return name, serving_root / "generations" / name
+    if (serving_root / "model.txt").exists():
+        info = json.loads((serving_root / "serving.json").read_text("utf-8"))
+        return info.get("version", "v1"), serving_root
+    raise FileNotFoundError(f"서비스 모델이 없음: {serving_root}")
+
+
 def fit_serving(warehouse: Path, out_dir: Path) -> dict:
-    """새 모델·산출물을 serving.new에 모두 만든 뒤 serving과 바꿔 끼운다(예측 작업이 반쯤 바뀐
-    파일을 읽지 않게). 이전 것은 serving.prev에 남긴다."""
     selected, version = selected_model(out_dir)
-    levels = selected == "M3"
-    serving_dir = out_dir / "serving.new"
-    shutil.rmtree(serving_dir, ignore_errors=True)
-    serving_dir.mkdir(parents=True)
+    if selected not in CANDIDATE_FEATURES:
+        raise SystemExit(f"기준선({selected})이 선택되어 서비스용 LightGBM 모델이 없음")
+    levels = _uses_levels(selected)
+    asof = version == "v3"
+    features = CANDIDATE_FEATURES[selected]
+    serving_root = out_dir / "serving"
+    generation = generation_name(version, selected, datetime.now(KST))
+    target = serving_root / "generations" / generation
+    target.mkdir(parents=True)
+
+    def frame(window: Window) -> dict:
+        con = duckdb.connect(str(warehouse), read_only=True)
+        try:
+            return load_frame(con, window, False, with_levels=levels, asof_stations=asof)
+        finally:
+            con.close()
+
     con = duckdb.connect(str(warehouse), read_only=True)
-    meta = artifacts.export(con, SERVING, serving_dir / "artifacts", with_levels=levels)
-    report: dict = {"selected": selected, "version": version, "history": SERVING, "artifacts": meta}
-    if selected in CANDIDATE_FEATURES:
-        started = time.perf_counter()
-        train = load_frame(con, Window(SERVING, SERVING), False, with_levels=levels)
+    try:
+        meta = artifacts.export(con, SERVING, target / "artifacts", with_levels=levels)
+    finally:
         con.close()
-        report["train_rows"] = int(len(train["rentals"]))
-        report["load_seconds"] = round(time.perf_counter() - started, 1)
-        log: dict = {}
-        booster, _ = fit_lightgbm(
-            train,
-            CANDIDATE_FEATURES[selected],
+    report: dict = {
+        "selected": selected,
+        "version": version,
+        "generation": generation,
+        "history": SERVING,
+        "artifacts": meta,
+    }
+    stop_from = shift_months(SERVING[1], -2)
+    log: dict = {}
+    started = time.perf_counter()
+    if asof:
+        booster, _ = fit_lightgbm_separate_stop(
+            lambda: frame(Window(SERVING, (SERVING[0], stop_from))),
+            lambda: frame(Window(SERVING, SERVING)),
+            features,
             log,
-            early_stop_from=shift_months(SERVING[1], -2),
-            consume=True,
+            stop_from,
         )
-        booster.save_model(str(serving_dir / "model.txt"))
-        report["training"] = log
     else:
-        con.close()
-        report["note"] = "기준선이 선택되어 LightGBM 모델 없음"
-    (serving_dir / "serving.json").write_text(
+        booster, _ = fit_lightgbm(
+            frame(Window(SERVING, SERVING)), features, log, early_stop_from=stop_from, consume=True
+        )
+    report["seconds"] = round(time.perf_counter() - started, 1)
+    report["training"] = log
+    booster.save_model(str(target / "model.txt"))
+    (target / "serving.json").write_text(
         json.dumps(report, ensure_ascii=False, indent=2, default=str), "utf-8"
     )
-    live, previous = out_dir / "serving", out_dir / "serving.prev"
-    shutil.rmtree(previous, ignore_errors=True)
-    if live.exists():
-        live.rename(previous)
-    serving_dir.rename(live)
+    publish_generation(serving_root, generation)
     return report
 
 
-def load_serving_model(out_dir: Path) -> lgb.Booster:
-    return lgb.Booster(model_file=str(out_dir / "serving" / "model.txt"))
+def load_serving_model(out_dir: Path) -> tuple[str, lgb.Booster, artifacts.Artifacts]:
+    """(세대 이름, 모델, 산출물). 모두 CURRENT를 한 번 읽어 정한 같은 세대에서 읽는다."""
+    name, directory = current_generation(out_dir / "serving")
+    booster = lgb.Booster(model_file=str(directory / "model.txt"))
+    return name, booster, artifacts.load(directory / "artifacts")
 
 
 if __name__ == "__main__":
     import argparse
 
-    parser = argparse.ArgumentParser(description="v1 test 측정과 서비스용 학습")
+    parser = argparse.ArgumentParser(description="test 한 번 측정과 서비스용 학습")
     parser.add_argument("step", choices=["test", "serving"])
     parser.add_argument("--warehouse", type=Path, default=Path("data/warehouse/bike_demand.duckdb"))
     parser.add_argument("--out", type=Path, default=Path("data/models/v1"))

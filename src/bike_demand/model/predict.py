@@ -203,22 +203,16 @@ if __name__ == "__main__":
     import argparse
     from pathlib import Path
 
-    from bike_demand.model import artifacts as artifacts_module
+    from bike_demand.model.final import load_serving_model
     from bike_demand.serving.db import make_engine
 
     parser = argparse.ArgumentParser(description="최신 스냅샷·예보로 앞으로의 시간을 예측해 저장")
     parser.add_argument("--models", type=Path, default=Path("data/models/v1"))
-    parser.add_argument("--name", help="model_version 앞부분 (기본: serving.json의 측정 버전)")
     parser.add_argument("--hours", type=int, default=48)
     args = parser.parse_args()
 
-    serving = args.models / "serving"
-    import json
-
-    serving_info = json.loads((serving / "serving.json").read_text("utf-8"))
-    name = args.name or serving_info.get("version", "v1")
-    booster = lgb.Booster(model_file=str(serving / "model.txt"))
-    loaded = artifacts_module.load(serving / "artifacts")
+    # CURRENT를 한 번 읽어 고른 한 세대의 모델·산출물만 쓴다. 세대 이름이 model_version 앞부분(T29)
+    generation, booster, loaded = load_serving_model(args.models)
     now = datetime.now(KST)
-    version, count = predict_and_store(make_engine(), booster, loaded, name, now, args.hours)
+    version, count = predict_and_store(make_engine(), booster, loaded, generation, now, args.hours)
     print(version, count)
