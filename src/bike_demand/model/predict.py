@@ -187,7 +187,12 @@ def predict_and_store(
             conn.execute(
                 statement.on_conflict_do_update(
                     index_elements=["station_id", "hour_start", "model_version"],
-                    set_={"predicted_rentals": statement.excluded.predicted_rentals},
+                    # 같은 버전을 다시 만들면 값과 생성 시각을 새로 한다
+                    # (API는 생성 시각으로 쓸 버전을 고름, docs/api.md)
+                    set_={
+                        "predicted_rentals": statement.excluded.predicted_rentals,
+                        "created_at": func.now(),
+                    },
                 ),
                 records[start : start + 5000],
             )
@@ -203,13 +208,17 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description="최신 스냅샷·예보로 앞으로의 시간을 예측해 저장")
     parser.add_argument("--models", type=Path, default=Path("data/models/v1"))
-    parser.add_argument("--name", default="v1", help="model_version 앞부분")
+    parser.add_argument("--name", help="model_version 앞부분 (기본: serving.json의 측정 버전)")
     parser.add_argument("--hours", type=int, default=48)
     args = parser.parse_args()
 
     serving = args.models / "serving"
+    import json
+
+    serving_info = json.loads((serving / "serving.json").read_text("utf-8"))
+    name = args.name or serving_info.get("version", "v1")
     booster = lgb.Booster(model_file=str(serving / "model.txt"))
     loaded = artifacts_module.load(serving / "artifacts")
     now = datetime.now(KST)
-    version, count = predict_and_store(make_engine(), booster, loaded, args.name, now, args.hours)
+    version, count = predict_and_store(make_engine(), booster, loaded, name, now, args.hours)
     print(version, count)

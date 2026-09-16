@@ -10,6 +10,13 @@ FastAPI 서비스(`src/bike_demand/api/`)가 지키는 요청·응답 형식. �
   - 503: 판단에 필요한 최신 데이터가 없음(`detail`에 무엇이 없는지)
 - 인증 없음(읽기 전용 공개 데이터)
 
+### 어느 예측을 쓰나 (모든 응답 공통)
+- `predictions`에는 예측 작업이 돌 때마다(단기예보 발표마다) 새 `model_version` 묶음이 쌓이고, 같은 시간을 여러 버전이 예측한다
+- **쓸 버전 = `created_at`이 가장 늦은 행의 `model_version`** (가장 최근에 만든 묶음). 같으면 `model_version` 문자열이 큰 것
+  - `/predictions/{station_id}`만 예외: 요청한 날짜의 행이 있는 버전 중에서 위 규칙으로 고른다
+- 한 응답 안에서 **버전을 섞지 않는다**. 고른 버전에 필요한 시간이 없으면 그 시간은 없는 것으로 처리한다(아래 각 절의 규칙)
+- 응답의 `model_version`은 고른 버전이다
+
 ## `GET /health`
 ```json
 {"status": "ok", "database": "ok", "latest_snapshot_at": "2026-09-17T08:10:03+09:00", "latest_prediction_hour": "2026-09-17T23:00:00+09:00"}
@@ -44,7 +51,7 @@ FastAPI 서비스(`src/bike_demand/api/`)가 지키는 요청·응답 형식. �
 }
 ```
 - `snapshot`: 없으면 `null`
-- `predictions`: 현재 시각이 든 시간부터 6개. 가장 최근 `model_version`의 값만. 없으면 빈 목록, `model_version`은 `null`
+- `predictions`: 현재 시각이 든 시간부터 6시간 중 고른 버전에 있는 시간만(순서대로). 예측이 하나도 없으면 빈 목록, `model_version`은 `null`
 
 ## `GET /shortage-risk`
 곧 자전거가 부족해질 대여소 목록. 서비스의 핵심 응답.
@@ -91,5 +98,5 @@ FastAPI 서비스(`src/bike_demand/api/`)가 지키는 요청·응답 형식. �
 {"station_id": "ST-1121", "date": "2026-09-17", "model_version": "v1-...",
  "hours": [{"hour_start": "2026-09-17T00:00:00+09:00", "predicted_rentals": 0.1}]}
 ```
-- 그날 예측이 있는 가장 최근 `model_version`의 24시간(없는 시간은 목록에서 빠짐)
+- 그날(KST 0~23시) 행이 있는 버전 중 `created_at`이 가장 늦은 버전의 시간들(없는 시간은 목록에서 빠짐)
 - 없는 대여소 404, 그날 예측이 없으면 `hours`가 빈 목록
