@@ -56,11 +56,23 @@ def _day_index(day: str) -> int:
 
 
 def fit_lightgbm(
-    train: dict[str, np.ndarray], features: list[str], log: dict
+    train: dict[str, np.ndarray],
+    features: list[str],
+    log: dict,
+    early_stop_from: str = EARLY_STOP_FROM,
+    consume: bool = False,
 ) -> tuple[lgb.Booster, int]:
+    """early_stop_from 이후(학습 기간의 마지막 두 달)로 라운드 수를 정한다.
+
+    그 라운드 수로 학습 기간 전체에서 다시 학습한 모델을 돌려준다.
+    """
     categorical = [f for f in features if f in CATEGORICAL]
-    split = train["day_index"] < _day_index(EARLY_STOP_FROM)
+    split = train["day_index"] < _day_index(early_stop_from)
     matrix = feature_matrix(train, features)
+    if consume:  # 행렬을 만든 뒤 특징 열은 더 쓰지 않으므로 메모리에서 뺀다(큰 기간 학습용)
+        for name in features:
+            train.pop(name, None)
+        gc.collect()
 
     started = time.perf_counter()
     fit_set = lgb.Dataset(

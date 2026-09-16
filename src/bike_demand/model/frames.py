@@ -42,7 +42,7 @@ class Window:
     history: tuple[str, str]
 
 
-def _shift_months(day: str, months: int) -> str:
+def shift_months(day: str, months: int) -> str:
     year, month, _ = map(int, day.split("-"))
     total = year * 12 + (month - 1) + months
     return f"{total // 12:04d}-{total % 12 + 1:02d}-01"
@@ -51,8 +51,8 @@ def _shift_months(day: str, months: int) -> str:
 def trend_windows(history: tuple[str, str]) -> tuple[tuple[str, str], tuple[str, str]]:
     """(마지막 6개월, 그 1년 전 같은 6개월). history 끝은 달의 첫날이어야 한다."""
     end = history[1]
-    last = (_shift_months(end, -6), end)
-    prior = (_shift_months(end, -18), _shift_months(end, -12))
+    last = (shift_months(end, -6), end)
+    prior = (shift_months(end, -18), shift_months(end, -12))
     return last, prior
 
 

@@ -168,3 +168,24 @@ def predict_and_store(
                 records[start : start + 5000],
             )
     return version, len(records)
+
+
+if __name__ == "__main__":
+    import argparse
+    from pathlib import Path
+
+    from bike_demand.model import artifacts as artifacts_module
+    from bike_demand.serving.db import make_engine
+
+    parser = argparse.ArgumentParser(description="최신 스냅샷·예보로 앞으로의 시간을 예측해 저장")
+    parser.add_argument("--models", type=Path, default=Path("data/models/v1"))
+    parser.add_argument("--name", default="v1", help="model_version 앞부분")
+    parser.add_argument("--hours", type=int, default=48)
+    args = parser.parse_args()
+
+    serving = args.models / "serving"
+    booster = lgb.Booster(model_file=str(serving / "model.txt"))
+    loaded = artifacts_module.load(serving / "artifacts")
+    now = datetime.now(KST)
+    version, count = predict_and_store(make_engine(), booster, loaded, args.name, now, args.hours)
+    print(version, count)
