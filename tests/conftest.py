@@ -32,14 +32,16 @@ def pg_engine():
     from alembic import command
     from alembic.config import Config
 
-    config = Config("alembic.ini", attributes={"configure_logger": False})
-    config.set_main_option("sqlalchemy.url", url.replace("%", "%%"))
-    command.upgrade(config, "head")
-    engine = make_engine(url)
-    try:
+    engine = None
+    try:  # 마이그레이션이 실패해도 임시 DB를 지운다
+        config = Config("alembic.ini", attributes={"configure_logger": False})
+        config.set_main_option("sqlalchemy.url", url.replace("%", "%%"))
+        command.upgrade(config, "head")
+        engine = make_engine(url)
         yield engine
     finally:
-        engine.dispose()
+        if engine is not None:
+            engine.dispose()
         with admin.connect() as conn:
             conn.execute(text(f'drop database if exists "{name}" with (force)'))
         admin.dispose()
