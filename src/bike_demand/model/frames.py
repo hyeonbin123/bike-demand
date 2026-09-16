@@ -119,6 +119,16 @@ global_trend as (
 
 # 반기 번호 = (연*12 + 월-1) // 6. 행이 속한 달 번호 n에서 1개월 이상 전에 끝난 가장 최근 반기는
 # (n - 7) // 6 이다 (반기 h는 달 [6h, 6h+6)을 덮고, 6h+6 <= n-1 이어야 함).
+def half_of_month(year: int, month: int) -> int:
+    """반기 번호. SQL의 (연*12 + 월-1) // 6과 같다."""
+    return (year * 12 + month - 1) // 6
+
+
+def published_half(year: int, month: int) -> int:
+    """그 달에 이미 공개돼 있던(1개월 이상 전에 끝난) 가장 최근 반기 번호."""
+    return (year * 12 + month - 1 - 7) // 6
+
+
 LEVEL_CTES = """
 halves as (
     select station_id, (year(hour_start) * 12 + month(hour_start) - 1) // 6 as half,

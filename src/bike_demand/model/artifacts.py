@@ -10,16 +10,22 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import duckdb
 import pyarrow.parquet as pq
 
-from bike_demand.model.frames import FEATURES, history_ctes
+from bike_demand.model.frames import FEATURES, LEVEL_CTES, history_ctes
 
 
-def export(con: duckdb.DuckDBPyConnection, history: tuple[str, str], out_dir: Path) -> dict:
+def export(
+    con: duckdb.DuckDBPyConnection,
+    history: tuple[str, str],
+    out_dir: Path,
+    with_levels: bool = False,
+) -> dict:
+    """with_levels: v2 수준 특징에 쓰는 반기별 대여소 평균·전체 합계도 저장한다(모든 반기)."""
     out_dir.mkdir(parents=True, exist_ok=True)
     ctes = history_ctes(history)
     queries = {
@@ -29,11 +35,20 @@ def export(con: duckdb.DuckDBPyConnection, history: tuple[str, str], out_dir: Pa
         "profile": "select station_id, is_offday, hour_of_day, profile_mean from profile",
         "trend": "select station_id, station_trend from trend",
     }
+    if with_levels:
+        ctes = LEVEL_CTES + ctes
+        queries["halves"] = "select station_id, half, half_mean from halves"
+        queries["system_halves"] = "select half, total from system_halves"
     for name, query in queries.items():
         path = (out_dir / f"{name}.parquet").as_posix()
         con.execute(f"copy (with {ctes} {query}) to '{path}' (format parquet)")
     global_trend = con.execute(f"with {ctes} select global_trend from global_trend").fetchone()[0]
-    meta = {"history": list(history), "global_trend": global_trend, "features": FEATURES}
+    meta = {
+        "history": list(history),
+        "global_trend": global_trend,
+        "features": FEATURES,
+        "with_levels": with_levels,
+    }
     (out_dir / "meta.json").write_text(json.dumps(meta, ensure_ascii=False, indent=2), "utf-8")
     return meta
 
@@ -47,6 +62,9 @@ class Artifacts:
     trend: dict[str, float | None]
     global_trend: float | None
     max_station_code: int
+    # v2 수준 특징용. 없으면 빈 dict(해당 특징은 결측)
+    halves: dict[tuple[str, int], float] = field(default_factory=dict)
+    system_halves: dict[int, float] = field(default_factory=dict)
 
 
 def load(directory: Path) -> Artifacts:
@@ -66,7 +84,20 @@ def load(directory: Path) -> Artifacts:
         for r in stations.values()
         if r["district"] is not None and r["district_code"] is not None
     }
+    halves: dict[tuple[str, int], float] = {}
+    system_halves: dict[int, float] = {}
+    if (directory / "halves.parquet").exists():
+        halves = {
+            (r["station_id"], int(r["half"])): r["half_mean"]
+            for r in pq.read_table(directory / "halves.parquet").to_pylist()
+        }
+        system_halves = {
+            int(r["half"]): r["total"]
+            for r in pq.read_table(directory / "system_halves.parquet").to_pylist()
+        }
     return Artifacts(
+        halves=halves,
+        system_halves=system_halves,
         stations=stations,
         district_codes=district_codes,
         profile=profile,

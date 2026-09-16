@@ -20,7 +20,7 @@ from sqlalchemy.dialects.postgresql import insert
 
 from bike_demand.model.artifacts import Artifacts
 from bike_demand.model.forecast_weather import hourly_weather
-from bike_demand.model.frames import FEATURES
+from bike_demand.model.frames import FEATURES, published_half
 from bike_demand.serving.models import Prediction, RealtimeSnapshot, Station, WeatherForecast
 
 KST = timezone(timedelta(hours=9))
@@ -46,8 +46,10 @@ def feature_rows(
     hours: list[datetime],
     weather: dict[datetime, dict[str, float]],
     artifacts: Artifacts,
+    features: list[str] | None = None,
 ) -> tuple[np.ndarray, list[tuple[str, datetime]]]:
-    """(특징 행렬, (station_id, hour_start) 목록). 열 순서는 frames.FEATURES."""
+    """(특징 행렬, (station_id, hour_start) 목록). 열 순서는 features(기본 frames.FEATURES)."""
+    features = features or FEATURES
     unseen = {}
     rows, keys = [], []
     for station in stations:
@@ -84,11 +86,33 @@ def feature_rows(
                 "profile_mean": _num(profile),
                 "station_trend": trend,
                 "global_trend": _num(artifacts.global_trend),
+                **level_features(station_id, hour_start, artifacts),
             }
-            rows.append([values[name] for name in FEATURES])
+            rows.append([values[name] for name in features])
             keys.append((station_id, hour_start))
-    matrix = np.asarray(rows, dtype=np.float32).reshape(len(rows), len(FEATURES))
+    matrix = np.asarray(rows, dtype=np.float32).reshape(len(rows), len(features))
     return matrix, keys
+
+
+def level_features(station_id: str, hour_start: datetime, artifacts: Artifacts) -> dict[str, float]:
+    """frames.LEVEL_SELECT와 같은 정의: 그 시각에 공개돼 있던 반기와 그 1년 전 반기."""
+    local = hour_start.astimezone(KST)
+    half = published_half(local.year, local.month)
+    mean = artifacts.halves.get((station_id, half))
+    prior = artifacts.halves.get((station_id, half - 2))
+    total = artifacts.system_halves.get(half)
+    prior_total = artifacts.system_halves.get(half - 2)
+    return {
+        "station_recent_mean": _num(mean),
+        "station_recent_ratio": _ratio(mean, prior),
+        "system_recent_ratio": _ratio(total, prior_total),
+    }
+
+
+def _ratio(numerator, denominator) -> float:
+    if numerator is None or denominator is None or denominator == 0:
+        return math.nan
+    return float(numerator) / float(denominator)
 
 
 def _num(value) -> float:
@@ -149,7 +173,7 @@ def predict_and_store(
     if not hours:
         raise RuntimeError("예측할 시간의 예보가 없음")
 
-    matrix, keys = feature_rows(stations, hours, weather, artifacts)
+    matrix, keys = feature_rows(stations, hours, weather, artifacts, booster.feature_name())
     predicted = booster.predict(matrix)
     version = f"{model_name}-fcst{base.astimezone(KST):%Y%m%d%H%M}"
     records = [

@@ -1,4 +1,4 @@
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 
 import lightgbm as lgb
 import numpy as np
@@ -38,6 +38,28 @@ def test_serving_features_match_training_features(small_warehouse, tmp_path):
     order = np.lexsort((frame["hour_of_day"], frame["day_index"], frame["station_code"]))
     np.testing.assert_allclose(serving, training[order], rtol=1e-5, equal_nan=True)
     assert keys[0] == ("ST-1", datetime(2024, 1, 16, tzinfo=KST))
+
+
+def test_serving_level_features_match_training(two_year_warehouse, tmp_path):
+    """v2 수준 특징도 학습 행과 서비스 행이 같아야 한다(공개 반기 경계가 있는 달들)."""
+    history = ("2023-01-01", "2025-01-01")
+    artifacts.export(two_year_warehouse, history, tmp_path, with_levels=True)
+    loaded = artifacts.load(tmp_path)
+    features = [*frames.FEATURES, *frames.LEVEL_FEATURES]
+    for day in ("2023-05-10", "2023-08-01", "2024-07-31", "2024-08-01", "2025-03-15"):
+        next_day = (date.fromisoformat(day) + timedelta(days=1)).isoformat()
+        window = frames.Window(rows=(day, next_day), history=history)
+        frame = frames.load_frame(two_year_warehouse, window, False, with_levels=True)
+        training = frames.feature_matrix(frame, features)
+        hours = sorted(
+            datetime(*map(int, day.split("-")), int(h), tzinfo=KST) for h in frame["hour_of_day"]
+        )
+        weather = {h: {"temp_c": 10.0, "rain_mm": 0.0, "wind_ms": 1.0, "humidity_pct": 50.0,
+                       "is_snow": 0.0} for h in hours}  # fmt: skip
+        station = [{"station_id": "ST-1"}]
+        serving, _ = predict.feature_rows(station, hours, weather, loaded, features)
+        order = np.argsort(frame["hour_of_day"])
+        np.testing.assert_allclose(serving, training[order], rtol=1e-5, equal_nan=True)
 
 
 def test_unseen_station_gets_new_code_and_serving_values(small_warehouse, tmp_path):

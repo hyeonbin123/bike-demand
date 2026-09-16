@@ -1,35 +1,7 @@
-import duckdb
 import numpy as np
 import pytest
 
 from bike_demand.model import frames
-
-
-@pytest.fixture
-def two_year_warehouse():
-    """대여소 하나가 반기마다 시간당 1, 2, 3, 4, 5대를 빌리는 2023-01 ~ 2025-06 격자."""
-    db = duckdb.connect()
-    db.execute("""
-        create table dim_stations as
-        select 'ST-1' as station_id, '강남구' as district, 10 as docks, 37.5 as lat, 127.0 as lon
-    """)
-    db.execute("""
-        create table dim_hours as
-        select h as hour_start, hour(h) as hour_of_day, isodow(h) as day_of_week,
-               month(h) as month, dayofyear(h) as day_of_year,
-               false as is_holiday, isodow(h) >= 6 as is_offday,
-               10.0 as temp_c, 0.0 as rain_mm, 1.0 as wind_ms, 50.0 as humidity_pct,
-               0.0 as snow_cm
-        from unnest(generate_series(timestamp '2023-01-01', timestamp '2025-06-30 23:00:00',
-                                    interval 1 hour)) t(h)
-    """)
-    db.execute("""
-        create table int_station_hour_grid as
-        select 'ST-1' as station_id, hour_start,
-               ((year(hour_start) - 2023) * 2 + (month(hour_start) > 6)::int + 1) as rentals
-        from dim_hours
-    """)
-    return db
 
 
 def levels_at(frame, day: str) -> tuple[float, ...]:
