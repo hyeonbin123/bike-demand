@@ -120,3 +120,30 @@ def test_migration_round_trip(pg_engine, revision):
         command.upgrade(config, "head")
         with pg_engine.connect() as conn:
             assert conn.execute(text("select to_regclass('stations')")).scalar_one() == "stations"
+
+
+def test_temporary_database_is_dropped_when_migration_fails(pg_engine):
+    """pg_engine이 쓰는 임시 DB 도구가 마이그레이션 실패에도 DB를 지우는지(T30)."""
+    from sqlalchemy.engine import make_url
+
+    from bike_demand.serving.db import database_url
+    from tests.conftest import temporary_database
+
+    def failing_upgrade(config, revision):
+        created.append(make_url(config.get_main_option("sqlalchemy.url")).database)
+        raise RuntimeError("migration failed")
+
+    created: list[str] = []
+    with pytest.raises(RuntimeError, match="migration failed"):
+        with temporary_database(upgrade=failing_upgrade):
+            pass
+    admin_url = make_url(database_url()).set(database="postgres")
+    from sqlalchemy import create_engine
+
+    admin = create_engine(admin_url)
+    with admin.connect() as conn:
+        left = conn.execute(
+            text("select count(*) from pg_database where datname = :n"), {"n": created[0]}
+        ).scalar_one()
+    admin.dispose()
+    assert left == 0

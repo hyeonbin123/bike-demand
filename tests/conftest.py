@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import uuid
+from contextlib import contextmanager
 
 import duckdb
 import pytest
@@ -16,8 +17,19 @@ from sqlalchemy.engine import make_url
 from bike_demand.serving.db import database_url, make_engine
 
 
-@pytest.fixture
-def pg_engine():
+class DatabaseUnavailable(Exception):
+    pass
+
+
+@contextmanager
+def temporary_database(upgrade=None):
+    """같은 서버에 임시 DB를 만들고 마이그레이션한 엔진을 준다. 어느 단계에서 실패해도 지운다.
+
+    upgrade: 테스트에서 마이그레이션 실패를 흉내 낼 때만 바꿔 넣는다.
+    """
+    from alembic import command
+    from alembic.config import Config
+
     base = make_url(database_url())
     admin = create_engine(base.set(database="postgres"), isolation_level="AUTOCOMMIT")
     name = f"bike_demand_test_{uuid.uuid4().hex[:12]}"
@@ -26,17 +38,14 @@ def pg_engine():
             conn.execute(text(f'create database "{name}"'))
     except Exception as exc:  # noqa: BLE001 - 접속 실패 종류와 상관없이 건너뜀
         admin.dispose()
-        pytest.skip(f"PostgreSQL에 접속할 수 없음 (docker compose up -d db): {type(exc).__name__}")
+        raise DatabaseUnavailable(type(exc).__name__) from None
 
     url = base.set(database=name).render_as_string(hide_password=False)
-    from alembic import command
-    from alembic.config import Config
-
     engine = None
-    try:  # 마이그레이션이 실패해도 임시 DB를 지운다
+    try:  # 생성 직후부터 정리를 보장한다(마이그레이션·엔진 생성 실패 포함)
         config = Config("alembic.ini", attributes={"configure_logger": False})
         config.set_main_option("sqlalchemy.url", url.replace("%", "%%"))
-        command.upgrade(config, "head")
+        (upgrade or command.upgrade)(config, "head")
         engine = make_engine(url)
         yield engine
     finally:
@@ -45,6 +54,15 @@ def pg_engine():
         with admin.connect() as conn:
             conn.execute(text(f'drop database if exists "{name}" with (force)'))
         admin.dispose()
+
+
+@pytest.fixture
+def pg_engine():
+    try:
+        with temporary_database() as engine:
+            yield engine
+    except DatabaseUnavailable as exc:
+        pytest.skip(f"PostgreSQL에 접속할 수 없음 (docker compose up -d db): {exc}")
 
 
 @pytest.fixture
