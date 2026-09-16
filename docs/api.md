@@ -15,7 +15,14 @@ FastAPI 서비스(`src/bike_demand/api/`)가 지키는 요청·응답 형식. �
 - **쓸 버전 = `created_at`이 가장 늦은 행의 `model_version`** (가장 최근에 만든 묶음). 같으면 `model_version` 문자열이 큰 것
   - `/predictions/{station_id}`만 예외: 요청한 날짜의 행이 있는 버전 중에서 위 규칙으로 고른다
 - 한 응답 안에서 **버전을 섞지 않는다**. 고른 버전에 필요한 시간이 없으면 그 시간은 없는 것으로 처리한다(아래 각 절의 규칙)
-- 응답의 `model_version`은 고른 버전이다
+- 응답의 `model_version`은 고른 버전이다. `predictions` 테이블이 비어 있을 때만 `null`
+- 버전은 **전체 DB 기준으로 하나** 고른다(대여소·자치구·시간 구간마다 따로 고르지 않음). 그 버전에 어떤 대여소·시간이 없으면 이전 버전으로 채우지 않는다
+
+### 숫자 반올림
+- `expected_rentals`, `shortfall`: 소수 첫째 자리
+- `predicted_rentals`: 소수 둘째 자리
+- 좌표(`lat`, `lon`), 대수(`bike_count`, `rack_count`, `docks`)는 반올림하지 않고 저장된 값 그대로
+- 계산(합계, 비교, 정렬)은 반올림 전 값으로 한다
 
 ## `GET /health`
 ```json
@@ -51,7 +58,7 @@ FastAPI 서비스(`src/bike_demand/api/`)가 지키는 요청·응답 형식. �
 }
 ```
 - `snapshot`: 없으면 `null`
-- `predictions`: 현재 시각이 든 시간부터 6시간 중 고른 버전에 있는 시간만(순서대로). 예측이 하나도 없으면 빈 목록, `model_version`은 `null`
+- `predictions`: 현재 시각이 든 시간부터 6시간 중 고른 버전에 이 대여소의 값이 있는 시간만(순서대로). 없으면 빈 목록(이때도 `model_version`은 고른 버전, `predictions` 테이블이 비었을 때만 `null`)
 
 ## `GET /shortage-risk`
 곧 자전거가 부족해질 대여소 목록. 서비스의 핵심 응답.
@@ -87,9 +94,11 @@ FastAPI 서비스(`src/bike_demand/api/`)가 지키는 요청·응답 형식. �
   ]
 }
 ```
-- 스냅샷이 기준 안에 하나도 없으면 503 `{"detail": "no recent snapshot"}`
-- 예측이 하나도 없으면 503 `{"detail": "no predictions"}`
-- 숫자는 소수 첫째 자리로 반올림해서 돌려준다(계산은 반올림 전 값으로)
+- 503은 **필터 전 전체 데이터** 기준으로만 낸다
+  - `predictions` 테이블이 비었으면 503 `{"detail": "no predictions"}` (먼저 확인)
+  - 모든 대여소를 통틀어 `max_snapshot_age_minutes` 안의 스냅샷이 하나도 없으면 503 `{"detail": "no recent snapshot"}`
+- 그 밖에 자치구 필터, 필요한 시간의 예측이 빠진 대여소 제외, `shortfall > 0` 조건 때문에 남는 대여소가 없으면 **200과 빈 `stations` 목록**
+- 반올림은 위 "숫자 반올림" 규칙
 
 ## `GET /predictions/{station_id}`
 쿼리: `date`(필수, `YYYY-MM-DD`, KST 날짜)
