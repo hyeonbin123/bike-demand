@@ -44,27 +44,117 @@ def test_is_complete_needs_last_day_before_today():
     assert not weather.is_complete("2026-08", date(2026, 8, 31))
 
 
-def test_fetch_month_pages_until_total():
-    items = hourly_items("2023-02", 28 * 24)  # 서버가 500개씩 준다고 가정해 두 쪽을 받게 함
-    seen_pages = []
-
+def paged_handler(items, seen_pages, page_size=500):
     def handler(request: httpx.Request) -> httpx.Response:
         params = request.url.params
-        assert params["startDt"] == "20230201" and params["endDt"] == "20230228"
+        assert params["numOfRows"] == str(page_size)
         page = int(params["pageNo"])
         seen_pages.append(page)
-        chunk = items[(page - 1) * 500 : page * 500]
+        chunk = items[(page - 1) * page_size : page * page_size]
         return httpx.Response(200, json=ok_body(chunk, total=len(items)))
 
-    client = httpx.Client(transport=httpx.MockTransport(handler))
+    return handler
+
+
+def test_fetch_month_pages_until_total(monkeypatch):
+    monkeypatch.setattr(weather, "PAGE_SIZE", 500)
+    items = hourly_items("2023-02", 28 * 24)  # 672개 -> 500개씩 두 쪽
+    seen_pages = []
+    client = httpx.Client(transport=httpx.MockTransport(paged_handler(items, seen_pages)))
     result = weather.fetch_month(client, SECRET, "2023-02")
     assert len(result) == 672
     assert seen_pages == [1, 2]
 
 
+def test_short_page_is_retried_then_recovers(monkeypatch):
+    monkeypatch.setattr(weather, "PAGE_SIZE", 500)
+    monkeypatch.setattr(weather.time, "sleep", lambda _: None)
+    items = hourly_items("2023-02", 672)
+    calls = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        page = int(request.url.params["pageNo"])
+        calls.append(page)
+        if page == 2 and calls.count(2) == 1:  # 두 번째 쪽이 처음에는 비어서 옴
+            return httpx.Response(200, json=ok_body([], total=672))
+        return httpx.Response(200, json=ok_body(items[(page - 1) * 500 : page * 500], total=672))
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    assert len(weather.fetch_month(client, SECRET, "2023-02")) == 672
+    assert calls == [1, 2, 2]
+
+
+def test_short_page_that_never_recovers_saves_nothing(tmp_path, monkeypatch):
+    monkeypatch.setattr(weather.time, "sleep", lambda _: None)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=ok_body([], total=744))
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    raw = tmp_path / "raw"
+    with pytest.raises(weather.ApiError, match="0개"):
+        list(weather.download(raw, ["2023-01"], SECRET, date(2023, 2, 10), client))
+    assert not weather.raw_path(raw, "2023-01").exists()
+
+
+def test_missing_observation_hours_are_allowed_when_total_matches():
+    items = hourly_items("2023-01", 700)  # 관측 자체가 빠진 시간: API도 700이라고 알림
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=ok_body(items, total=700))
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    assert len(weather.fetch_month(client, SECRET, "2023-01")) == 700
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        # resultMsg에 요청 URL을 되돌려 보내는 서버
+        lambda url: httpx.Response(
+            200,
+            json={"response": {"header": {"resultCode": "99", "resultMsg": str(url)}}},
+        ),
+        # XML 오류 본문에 URL 인코딩된 키가 섞인 경우
+        lambda url: httpx.Response(
+            401,
+            text=f"<OpenAPI_ServiceResponse><errMsg>{url}</errMsg></OpenAPI_ServiceResponse>",
+        ),
+        # 코드 자리에 자유 문자열
+        lambda url: httpx.Response(
+            200, json={"response": {"header": {"resultCode": f"bad {SECRET}"}}}
+        ),
+    ],
+)
+def test_error_responses_never_show_the_key(monkeypatch, response):
+    monkeypatch.setattr(weather.time, "sleep", lambda _: None)
+    client = httpx.Client(transport=httpx.MockTransport(lambda request: response(request.url)))
+    with pytest.raises(weather.ApiError) as info:
+        weather.fetch_month(client, SECRET + "+/=", "2023-02")
+    message = str(info.value)
+    for form in (SECRET, "secret-key-123%2B%2F%3D", "secret-key-123+/="):
+        assert form not in message
+
+
+def test_http_logs_do_not_contain_the_key(caplog):
+    items = hourly_items("2023-02", 672)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=ok_body(items))
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    with caplog.at_level("DEBUG"):
+        weather.fetch_month(client, SECRET, "2023-02")
+    assert SECRET not in caplog.text
+
+
 def test_api_error_does_not_leak_key(monkeypatch):
     monkeypatch.setattr(weather.time, "sleep", lambda _: None)
-    xml = "<OpenAPI_ServiceResponse><returnAuthMsg>SERVICE_KEY_IS_NOT_REGISTERED_ERROR"
+    xml = (
+        "<OpenAPI_ServiceResponse><cmmMsgHeader><errMsg>SERVICE ERROR</errMsg>"
+        "<returnAuthMsg>SERVICE_KEY_IS_NOT_REGISTERED_ERROR</returnAuthMsg>"
+        "<returnReasonCode>30</returnReasonCode></cmmMsgHeader></OpenAPI_ServiceResponse>"
+    )
 
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, text=xml)

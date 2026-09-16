@@ -4,7 +4,8 @@
 남기고 다시 받지 않는다. API는 전날(D-1)까지만 주므로 끝난 달만 저장한다.
 Parquet 변환은 원본 JSON에서 하므로 API를 다시 부르지 않고 몇 번이든 할 수 있다.
 
-인증키는 URL 쿼리에 들어가므로 오류 메시지나 로그에 요청 URL을 남기지 않는다.
+인증키는 URL 쿼리에 들어가므로 오류 메시지나 로그에 요청 URL·응답 본문을 남기지 않는다.
+전체 건수(totalCount)보다 덜 받은 달은 저장하지 않는다(관측 자체가 빠진 시간은 허용).
 """
 
 from __future__ import annotations
@@ -12,6 +13,7 @@ from __future__ import annotations
 import calendar
 import json
 import os
+import re
 import time
 from collections.abc import Iterator
 from datetime import date
@@ -20,6 +22,8 @@ from pathlib import Path
 import httpx
 import pyarrow as pa
 import pyarrow.parquet as pq
+
+from bike_demand.ingest._http import private_request, reflects_secret
 
 ENDPOINT = "https://apis.data.go.kr/1360000/AsosHourlyInfoService/getWthrDataList"
 SEOUL_STATION = "108"
@@ -46,25 +50,62 @@ def is_complete(month: str, today: date) -> bool:
     return last_day < today
 
 
-def _parse_body(response: httpx.Response) -> dict:
-    # 인증키 오류 같은 경우 JSON을 요청해도 XML이 온다. 본문 일부만 보여 주고 URL은 숨긴다.
+# 인증키 오류 같은 경우 JSON을 요청해도 XML이 온다. 본문은 보여 주지 않고, 형식이 정해진
+# 오류 이름(대문자·밑줄)과 코드(숫자)만 뽑아 쓴다. 자유 문자열(resultMsg 등)에는 서버가
+# 요청 URL을 되돌려 넣을 수 있기 때문이다.
+_XML_AUTH_MSG = re.compile(r"<returnAuthMsg>([A-Z_]{1,80})</returnAuthMsg>")
+_XML_REASON = re.compile(r"<returnReasonCode>(\d{1,4})</returnReasonCode>")
+
+
+def _parse_page(response: httpx.Response, service_key: str) -> tuple[list[dict], int]:
+    """(이번 쪽 항목, 전체 건수)를 돌려준다."""
+    text = response.text
+    if reflects_secret(text, service_key):
+        raise ApiError(f"인증키가 반사된 응답 (HTTP {response.status_code})")
     try:
         payload = response.json()
-    except ValueError as exc:
-        raise ApiError(
-            f"JSON이 아닌 응답 (HTTP {response.status_code}): {response.text[:200]}"
-        ) from exc
-    header = payload.get("response", {}).get("header", {})
-    if header.get("resultCode") != "00":
-        raise ApiError(f"API 오류 {header.get('resultCode')}: {header.get('resultMsg')}")
-    return payload["response"]["body"]
+    except ValueError:
+        auth, reason = _XML_AUTH_MSG.search(text), _XML_REASON.search(text)
+        detail = " ".join(m.group(1) for m in (auth, reason) if m) or "형식 알 수 없음"
+        raise ApiError(f"JSON이 아닌 응답 (HTTP {response.status_code}): {detail}") from None
+    if not isinstance(payload, dict) or not isinstance(payload.get("response"), dict):
+        raise ApiError("응답 구조 오류")
+    header = payload["response"].get("header")
+    code = header.get("resultCode") if isinstance(header, dict) else None
+    if code != "00":
+        safe = code if isinstance(code, str) and re.fullmatch(r"\d{1,3}", code) else "알 수 없음"
+        raise ApiError(f"API 오류 코드 {safe}")
+    body = payload["response"].get("body")
+    if not isinstance(body, dict):
+        raise ApiError("응답 본문 구조 오류")
+    total = str(body.get("totalCount", ""))
+    if not total.isdigit():
+        raise ApiError("응답 전체 건수 오류")
+    container = body.get("items")
+    items = container.get("item", []) if isinstance(container, dict) else []
+    if not isinstance(items, list) or any(not isinstance(i, dict) for i in items):
+        raise ApiError("응답 항목 구조 오류")
+    return items, int(total)
 
 
-def _get_page(client: httpx.Client, params: dict[str, str], retries: int, label: str) -> dict:
+def _get_page(
+    client: httpx.Client,
+    params: dict[str, str],
+    retries: int,
+    label: str,
+    received: int,
+) -> tuple[list[dict], int]:
+    """한 쪽을 받는다. 앞서 받은 수(received)로 이 쪽에 와야 할 개수를 확인해 다르면 다시 받는다."""
     for attempt in range(1, retries + 1):
         try:
-            return _parse_body(client.get(ENDPOINT, params=params))
-        except (httpx.TransportError, ApiError) as exc:
+            with private_request():
+                response = client.get(ENDPOINT, params=params)
+            items, total = _parse_page(response, params["serviceKey"])
+            expected = max(0, min(PAGE_SIZE, total - received))
+            if len(items) != expected:
+                raise ApiError(f"항목 {len(items)}개, 전체 건수로 보면 {expected}개여야 함")
+            return items, total
+        except (httpx.HTTPError, ApiError) as exc:
             if attempt == retries:
                 # httpx 예외 메시지에는 인증키가 든 URL이 들어갈 수 있어 예외 종류만 남긴다.
                 detail = str(exc) if isinstance(exc, ApiError) else type(exc).__name__
@@ -97,10 +138,11 @@ def fetch_month(
     items: list[dict] = []
     page = 1
     while True:
-        body = _get_page(client, {**params, "pageNo": str(page)}, retries, f"{month} {page}쪽")
-        page_items = body.get("items", {}).get("item", []) if body.get("items") else []
+        page_items, total = _get_page(
+            client, {**params, "pageNo": str(page)}, retries, f"{month} {page}쪽", len(items)
+        )
         items.extend(page_items)
-        if len(items) >= int(body.get("totalCount", 0)) or not page_items:
+        if len(items) >= total:
             break
         page += 1
     return items
