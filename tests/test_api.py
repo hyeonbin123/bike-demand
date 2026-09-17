@@ -163,13 +163,19 @@ def test_daily_predictions_pick_version_within_the_day(client, pg_engine):
             {"station_id": "ST-1", "hour_start": tomorrow + timedelta(hours=h),
              "model_version": "v2-new", "predicted_rentals": 2.0, "created_at": NOW}
             for h in range(3)
+        ] + [
+            {"station_id": "ST-2", "hour_start": tomorrow + timedelta(hours=h),
+             "model_version": "v1-old", "predicted_rentals": 1.0,
+             "created_at": NOW - timedelta(hours=5)}
+            for h in range(3)
         ])  # fmt: skip
     today = client.get("/predictions/ST-1", params={"date": "2026-09-17"}).json()
     assert today["model_version"] == "v1-old"  # 오늘 행이 있는 버전 중에서 고름
     assert today["hours"][0]["hour_start"] == "2026-09-17T00:00:00+09:00"
     later = client.get("/predictions/ST-1", params={"date": "2026-09-18"}).json()
     assert later["model_version"] == "v2-new"
-    # 18일 새 버전에는 ST-2가 없다: 옛 버전으로 채우지 않고 새 버전 + 빈 목록(T34)
+    # 같은 18일에 ST-1은 새 버전만, ST-2는 옛 버전만 있다: ST-2도 옛 버전으로 채우지 않고
+    # 새 버전 + 빈 목록(T34, T38)
     other = client.get("/predictions/ST-2", params={"date": "2026-09-18"}).json()
     assert other["model_version"] == "v2-new" and other["hours"] == []
     none_that_day = client.get("/predictions/ST-1", params={"date": "2026-10-01"}).json()
