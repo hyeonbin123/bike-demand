@@ -264,6 +264,32 @@ def test_success_response_reflecting_key_is_not_saved(tmp_path, key, echo_url):
     assert not list(tmp_path.rglob("*.json"))
 
 
+def test_unicode_escaped_key_in_decoded_payload_is_not_saved(tmp_path, caplog):
+    payload = ok_body([row()])
+    payload["unknown_top"] = {"nested": [{"echo": SECRET}]}
+    escaped = "".join(f"\\u{ord(char):04x}" for char in SECRET)
+    body = json.dumps(payload).replace(SECRET, escaped)
+    assert SECRET not in body
+    assert json.loads(body)["unknown_top"]["nested"][0]["echo"] == SECRET
+    calls = []
+
+    def handler(request):
+        calls.append(1)
+        return httpx.Response(200, text=body)
+
+    with (
+        caplog.at_level(logging.DEBUG),
+        httpx.Client(transport=httpx.MockTransport(handler)) as client,
+    ):
+        with pytest.raises(realtime.ApiError, match="인증정보") as info:
+            realtime.download(tmp_path, SECRET, NOW, client, retries=2)
+    assert calls == [1, 1]
+    rendered = "".join(traceback.format_exception(info.value)) + caplog.text
+    assert SECRET not in rendered and escaped not in rendered
+    assert realtime.ENDPOINT not in rendered
+    assert not [path for path in tmp_path.rglob("*") if path.is_file()]
+
+
 def test_failed_parquet_replace_keeps_previous_file(tmp_path, monkeypatch):
     out = tmp_path / "snapshots.parquet"
     out.write_bytes(b"previous")

@@ -14,28 +14,24 @@ Parquet은 모든 격자의 원본 전체에서 다시 만들고, 모든 컬럼�
 from __future__ import annotations
 
 import json
-import logging
 import os
 import re
 import tempfile
 import time
-from collections.abc import Iterator
-from contextlib import contextmanager
-from contextvars import ContextVar
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from urllib.parse import quote, quote_plus, unquote
 
 import httpx
 import pyarrow as pa
 import pyarrow.parquet as pq
+
+from bike_demand.ingest._http import private_request, reflects_secret
 
 ENDPOINT = "https://apis.data.go.kr/1360000/VilageFcstInfoService_2.0/getVilageFcst"
 KST = timezone(timedelta(hours=9), name="KST")
 BASE_HOURS = (2, 5, 8, 11, 14, 17, 20, 23)
 PAGE_SIZE = 1000
 SEOUL_NX, SEOUL_NY = 60, 127
-_REQUEST_ACTIVE: ContextVar[bool] = ContextVar("forecast_request_active", default=False)
 SCHEMA = pa.schema(
     [
         (name, pa.string())
@@ -54,41 +50,6 @@ SCHEMA = pa.schema(
 
 class ApiError(RuntimeError):
     """요청 URL이나 응답 본문을 포함하지 않는 수집 오류."""
-
-
-class _RequestLogFilter(logging.Filter):
-    def filter(self, record: logging.LogRecord) -> bool:
-        return not _REQUEST_ACTIVE.get()
-
-
-@contextmanager
-def _private_request() -> Iterator[None]:
-    # 전역 로그 레벨을 바꾸지 않고 현재 실행 흐름의 요청만 숨긴다.
-    names = {
-        "httpx",
-        "httpcore",
-        "httpcore.connection",
-        "httpcore.http11",
-        "httpcore.http2",
-        "httpcore.proxy",
-        "httpcore.socks",
-    }
-    names.update(
-        name
-        for name in list(logging.Logger.manager.loggerDict)
-        if name.startswith(("httpx.", "httpcore."))
-    )
-    loggers = [logging.getLogger(name) for name in names]
-    filter_ = _RequestLogFilter()
-    token = _REQUEST_ACTIVE.set(True)
-    for logger in loggers:
-        logger.addFilter(filter_)
-    try:
-        yield
-    finally:
-        for logger in loggers:
-            logger.removeFilter(filter_)
-        _REQUEST_ACTIVE.reset(token)
 
 
 def _kst(value: datetime) -> datetime:
@@ -164,14 +125,7 @@ def _parse_page(
     except ValueError:
         raise ApiError("JSON이 아닌 응답") from None
     serialized = json.dumps(payload, ensure_ascii=False)
-    variants = {
-        service_key,
-        quote(service_key, safe=""),
-        quote_plus(service_key),
-        unquote(service_key),
-    }
-    variants.update(json.dumps(secret, ensure_ascii=False)[1:-1] for secret in tuple(variants))
-    if any(secret and secret in serialized for secret in variants):
+    if reflects_secret(serialized, service_key):
         raise ApiError("인증정보가 반사된 응답은 저장하지 않음")
     if not isinstance(payload, dict) or not isinstance(payload.get("response"), dict):
         raise ApiError("API 응답 구조 오류")
@@ -219,7 +173,7 @@ def _get_page(
 ) -> tuple[dict, list[dict], int]:
     for attempt in range(1, retries + 1):
         try:
-            with _private_request():
+            with private_request():
                 response = client.get(ENDPOINT, params=params)
             return _parse_page(response, params["serviceKey"], base, nx, ny, count, total, seen)
         except (httpx.HTTPError, ApiError) as exc:

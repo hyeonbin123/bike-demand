@@ -13,26 +13,23 @@ bronze: 날짜별 snapshots.parquet. 알려진 필드와 fetched_at을 문자열
 from __future__ import annotations
 
 import json
-import logging
 import os
 import re
 import tempfile
 import time
-from collections.abc import Iterator
-from contextlib import contextmanager
-from contextvars import ContextVar
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from urllib.parse import quote, quote_plus
+from urllib.parse import quote
 
 import httpx
 import pyarrow as pa
 import pyarrow.parquet as pq
 
+from bike_demand.ingest._http import private_request, reflects_secret
+
 ENDPOINT = "http://openapi.seoul.go.kr:8088"
 PAGE_SIZE = 1000
 KST = timezone(timedelta(hours=9))
-_REQUEST_ACTIVE: ContextVar[bool] = ContextVar("realtime_request_active", default=False)
 FIELDS = {
     "rackTotCnt": "rack_count",
     "stationName": "station_name",
@@ -47,41 +44,6 @@ SCHEMA = pa.schema([("fetched_at", pa.string()), *[(v, pa.string()) for v in FIE
 
 class ApiError(RuntimeError):
     """인증키나 요청 URL을 포함하지 않는 수집 오류."""
-
-
-class _HideRequestLog(logging.Filter):
-    def filter(self, record: logging.LogRecord) -> bool:
-        return not _REQUEST_ACTIVE.get()
-
-
-@contextmanager
-def _private_request() -> Iterator[None]:
-    """현재 요청의 HTTP 로그만 숨긴다. 하위 로거의 응답 헤더에도 키가 섞일 수 있다."""
-    names = {
-        "httpx",
-        "httpcore",
-        "httpcore.connection",
-        "httpcore.http11",
-        "httpcore.http2",
-        "httpcore.proxy",
-        "httpcore.socks",
-    }
-    names.update(
-        name
-        for name in list(logging.Logger.manager.loggerDict)
-        if name.startswith(("httpx.", "httpcore."))
-    )
-    loggers = [logging.getLogger(name) for name in names]
-    hide = _HideRequestLog()
-    token = _REQUEST_ACTIVE.set(True)
-    for logger in loggers:
-        logger.addFilter(hide)
-    try:
-        yield
-    finally:
-        for logger in loggers:
-            logger.removeFilter(hide)
-        _REQUEST_ACTIVE.reset(token)
 
 
 def _kst(value: datetime) -> datetime:
@@ -100,9 +62,7 @@ def _parse_page(response: httpx.Response, service_key: str) -> tuple[dict, list[
         raise ApiError("응답 구조 오류")
     # 잘못된 서버가 인증키/요청 URL을 반사해도 원본 파일에 저장하지 않는다.
     serialized = json.dumps(payload, ensure_ascii=False)
-    variants = {service_key, quote(service_key, safe=""), quote_plus(service_key)}
-    variants.update(json.dumps(token, ensure_ascii=False)[1:-1] for token in tuple(variants))
-    if any(token in serialized for token in variants) or ENDPOINT in serialized:
+    if reflects_secret(serialized, service_key) or ENDPOINT in serialized:
         raise ApiError("응답에 요청 인증정보가 포함됨")
     body = payload.get("rentBikeStatus", payload)
     if not isinstance(body, dict) or not isinstance(body.get("RESULT"), dict):
@@ -132,7 +92,7 @@ def _get_page(
     url = f"{ENDPOINT}/{quote(service_key, safe='')}/json/bikeList/{start}/{start + PAGE_SIZE - 1}/"
     for attempt in range(1, retries + 1):
         try:
-            with _private_request():
+            with private_request():
                 response = client.get(url)
             payload, rows, no_data = _parse_page(response, service_key)
             if no_data and start - 1 < previous_total:

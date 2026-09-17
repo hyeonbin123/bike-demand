@@ -196,6 +196,32 @@ def test_failures_hide_keys_in_errors_tracebacks_and_logs(kind, caplog):
         assert forecast.ENDPOINT not in output
 
 
+def test_unicode_escaped_key_in_decoded_payload_is_not_saved(tmp_path, caplog):
+    payload = ok_body(items(1))
+    payload["unknown_top"] = {"nested": [{"echo": SECRET}]}
+    escaped = "".join(f"\\u{ord(char):04x}" for char in SECRET)
+    body = json.dumps(payload).replace(SECRET, escaped)
+    assert SECRET not in body
+    assert json.loads(body)["unknown_top"]["nested"][0]["echo"] == SECRET
+    calls = []
+
+    def handler(request):
+        calls.append(request.url.params["pageNo"])
+        return httpx.Response(200, text=body)
+
+    with (
+        caplog.at_level(logging.DEBUG),
+        httpx.Client(transport=httpx.MockTransport(handler)) as client,
+    ):
+        with pytest.raises(forecast.ApiError, match="반사") as info:
+            forecast.download(tmp_path, SECRET, now=NOW, client=client, retries=2)
+    assert calls == ["1", "1"]
+    rendered = "".join(traceback.format_exception(info.value)) + caplog.text
+    assert SECRET not in rendered and escaped not in rendered
+    assert quote(SECRET, safe="") not in rendered and forecast.ENDPOINT not in rendered
+    assert not [path for path in tmp_path.rglob("*") if path.is_file()]
+
+
 def test_successful_request_logs_hidden_without_changing_logger_settings(caplog):
     caplog.set_level(logging.INFO)
     logger = logging.getLogger("httpx")
