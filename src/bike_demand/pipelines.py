@@ -4,14 +4,15 @@
   반기 갱신 DAG가 날씨 수집과 달력(dbt var calendar_end)에 같은 끝을 넘기는 데 쓴다(T32).
 - collect-realtime: 실시간 스냅샷 수집 → 그날 Parquet 재생성 → 서비스 DB 적재.
   적재할 날짜를 **수집 시각**(KST)에서 정한다. 수집과 적재를 따로 돌리면 23:59대에 수집한 스냅샷을
-  자정 뒤에 적재할 때 날짜가 달라져 빠질 수 있다(T23).
+  자정 뒤에 적재할 때 날짜가 달라져 빠질 수 있다(T23). 적재가 실패해 남은 지난 날의 원본은
+  다음 정상 실행이 회수한다(T35, T39).
 """
 
 from __future__ import annotations
 
 import calendar
 import os
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 import httpx
@@ -33,6 +34,32 @@ def last_day(month: str) -> str:
     return f"{month}-{calendar.monthrange(year, mon)[1]:02d}"
 
 
+# 적재에 성공한 원본 파일 이름 목록. 원본 목록과 다르면 그날은 아직 다 적재되지 않은 것이다.
+LOADED_MARKER = "loaded.txt"
+# 이보다 오래된 날은 매번 살피지 않는다. 그런 날은 원본 폴더를 보고 직접 다시 적재한다.
+RECOVER_DAYS = 7
+
+
+def _raw_names(raw_dir: Path, day: date) -> list[str]:
+    return sorted(path.name for path in (raw_dir / f"date={day:%Y-%m-%d}").glob("*.json"))
+
+
+def _marker(bronze_dir: Path, day: date) -> Path:
+    return bronze_dir / f"date={day:%Y-%m-%d}" / LOADED_MARKER
+
+
+def _loaded_names(bronze_dir: Path, day: date) -> list[str] | None:
+    path = _marker(bronze_dir, day)
+    return path.read_text(encoding="utf-8").split() if path.exists() else None
+
+
+def _mark_loaded(bronze_dir: Path, day: date, names: list[str]) -> None:
+    path = _marker(bronze_dir, day)
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text("".join(f"{name}\n" for name in names), encoding="utf-8", newline="\n")
+    os.replace(tmp, path)
+
+
 def collect_realtime(
     engine: Engine,
     raw_dir: Path,
@@ -41,22 +68,25 @@ def collect_realtime(
     now: datetime | None = None,
     client: httpx.Client | None = None,
 ) -> dict:
-    """수집 → 그날 Parquet 재생성 → 적재. 0시대에 돌면 전날도 다시 만들고 적재한다.
+    """수집 → 그날 Parquet 재생성 → 적재. 덜 적재된 지난 날도 다시 만들고 적재한다.
 
-    23:59대에 수집은 됐지만 적재가 실패하고, 재시도가 자정을 넘기면 그 스냅샷은 전날 폴더에만
-    남는다(T35). 적재는 이미 있는 행을 건너뛰므로 전날을 다시 적재해도 중복되지 않는다.
+    적재가 실패하면 그 날의 스냅샷은 원본 폴더에만 남는다. 23:59대 수집분의 재시도가 자정을 넘기거나
+    DB 장애가 몇 시간 이어지면 수집 날짜가 이미 지나 있다(T35, T39). 그래서 날마다 적재에 성공한
+    원본 이름을 bronze 폴더의 loaded.txt에 남기고, 최근 RECOVER_DAYS일 중 원본 목록과 기록이 다른
+    날을 오늘과 함께 다시 적재한다. 적재는 이미 있는 행을 건너뛰므로 중복되지 않는다.
     """
     collected_at = realtime._kst(now or datetime.now(realtime.KST))
     day = collected_at.date()
     path, status = realtime.download(raw_dir, service_key, collected_at, client=client)
-    days = [day - timedelta(days=1), day] if collected_at.hour == 0 else [day]
+    past = [day - timedelta(days=n) for n in range(RECOVER_DAYS, 0, -1)]
+    pending = [d for d in past if _raw_names(raw_dir, d) not in ([], _loaded_names(bronze_dir, d))]
     result: dict = {"day": day.isoformat(), "raw": str(path), "status": status, "days": {}}
-    for target in days:
-        if not (raw_dir / f"date={target:%Y-%m-%d}").exists():
-            continue
+    for target in [*pending, day]:
+        names = _raw_names(raw_dir, target)
         parquet = bronze_dir / f"date={target:%Y-%m-%d}" / "snapshots.parquet"
         rows = realtime.to_parquet(raw_dir, parquet, target)
         snapshots, stations = load.load_realtime(engine, bronze_dir, target)
+        _mark_loaded(bronze_dir, target, names)
         result["days"][target.isoformat()] = {
             "parquet_rows": rows,
             "snapshots_inserted": snapshots,

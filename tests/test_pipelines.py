@@ -55,7 +55,7 @@ def test_latest_trip_month_and_last_day(tmp_path):
 
 
 def test_retry_after_midnight_recovers_the_previous_day(pg_engine, tmp_path, monkeypatch):
-    """23:59:59 수집 성공 → 적재 실패 → 00:02 재시도에서 전날 스냅샷도 적재된다(T35)."""
+    """23:59:59 수집 성공 → 적재 실패 → 00:02 다음 실행에서 전날 스냅샷도 적재된다(T35)."""
     from bike_demand.serving import load
 
     raw, bronze = tmp_path / "raw", tmp_path / "bronze"
@@ -86,8 +86,54 @@ def test_retry_after_midnight_recovers_the_previous_day(pg_engine, tmp_path, mon
         count = conn.execute(select(func.count()).select_from(RealtimeSnapshot)).scalar_one()
     assert count == 4
 
-    # 한 시간 뒤(1시대)에는 전날을 다시 건드리지 않는다
+    # 이미 다 적재한 전날은 다시 건드리지 않는다
     calls.clear()
     one_am = datetime(2026, 9, 17, 1, 0, tzinfo=realtime.KST)
     collect_realtime(pg_engine, raw, bronze, SECRET, one_am, client)
     assert calls == [date(2026, 9, 17)]
+
+
+def test_failures_through_the_midnight_hour_are_recovered_later(pg_engine, tmp_path, monkeypatch):
+    """23:59와 0시대 재시도가 모두 적재에 실패해도 1시대 이후 정상 실행이 전날을 회수한다(T39)."""
+    from bike_demand.serving import load
+
+    raw, bronze = tmp_path / "raw", tmp_path / "bronze"
+    client = httpx.Client(transport=httpx.MockTransport(bike_list))
+    real_load = load.load_realtime
+    calls = []
+    db_down = {"value": True}
+
+    def flaky_load(engine, bronze_dir, day):
+        calls.append(day)
+        if db_down["value"]:
+            raise RuntimeError("DB 장애")
+        return real_load(engine, bronze_dir, day)
+
+    monkeypatch.setattr(load, "load_realtime", flaky_load)
+    for at in (datetime(2026, 9, 16, 23, 59, 59), datetime(2026, 9, 17, 0, 2)):
+        try:
+            collect_realtime(
+                pg_engine, raw, bronze, SECRET, at.replace(tzinfo=realtime.KST), client
+            )
+        except RuntimeError:
+            pass
+    assert not (bronze / "date=2026-09-16" / "loaded.txt").exists()
+
+    db_down["value"] = False
+    calls.clear()
+    late = datetime(2026, 9, 17, 3, 10, tzinfo=realtime.KST)
+    result = collect_realtime(pg_engine, raw, bronze, SECRET, late, client)
+    assert calls == [date(2026, 9, 16), date(2026, 9, 17)]
+    assert result["days"]["2026-09-16"]["snapshots_inserted"] == 2
+    assert result["days"]["2026-09-17"]["snapshots_inserted"] == 4  # 00:02와 03:10
+    loaded = (bronze / "date=2026-09-16" / "loaded.txt").read_text(encoding="utf-8").split()
+    assert loaded == ["235959.json"]
+
+    # 다음 실행은 오늘만 적재하고, 같은 원본을 다시 넣어도 행이 늘지 않는다
+    calls.clear()
+    again = datetime(2026, 9, 17, 3, 20, tzinfo=realtime.KST)
+    collect_realtime(pg_engine, raw, bronze, SECRET, again, client)
+    assert calls == [date(2026, 9, 17)]
+    with pg_engine.connect() as conn:
+        count = conn.execute(select(func.count()).select_from(RealtimeSnapshot)).scalar_one()
+    assert count == 8
