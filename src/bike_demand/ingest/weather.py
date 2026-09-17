@@ -132,15 +132,30 @@ def fetch_month(
 ) -> list[dict]:
     year, mon = map(int, month.split("-"))
     last = calendar.monthrange(year, mon)[1]
+    start, end = date(year, mon, 1), date(year, mon, last)
+    return fetch_range(client, service_key, start, end, station, retries, label=month)
+
+
+def fetch_range(
+    client: httpx.Client,
+    service_key: str,
+    start: date,
+    end: date,
+    station: str = SEOUL_STATION,
+    retries: int = 3,
+    label: str | None = None,
+) -> list[dict]:
+    """start 0시 ~ end 23시 관측. 끝나지 않은 달 일부도 받는다(v4 측정용, 저장 안 함)."""
+    label = label or f"{start:%Y-%m-%d}~{end:%Y-%m-%d}"
     params = {
         "serviceKey": service_key,
         "dataType": "JSON",
         "dataCd": "ASOS",
         "dateCd": "HR",
         "stnIds": station,
-        "startDt": f"{year}{mon:02d}01",
+        "startDt": f"{start:%Y%m%d}",
         "startHh": "00",
-        "endDt": f"{year}{mon:02d}{last:02d}",
+        "endDt": f"{end:%Y%m%d}",
         "endHh": "23",
         "numOfRows": str(PAGE_SIZE),
     }
@@ -152,7 +167,7 @@ def fetch_month(
             client,
             {**params, "pageNo": str(page)},
             retries,
-            f"{month} {page}쪽",
+            f"{label} {page}쪽",
             len(items),
             first_total,
         )

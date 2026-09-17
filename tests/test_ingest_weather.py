@@ -247,3 +247,19 @@ def test_total_count_changing_between_pages_is_retried_then_fails(tmp_path, monk
     # 1쪽은 다시 받지 않고, 건수가 어긋난 2쪽만 세 번 시도한다(T40)
     assert pages == [1, 2, 2, 2]
     assert not weather.raw_path(raw, "2023-01").exists()
+
+
+def test_fetch_range_asks_for_the_given_days_only():
+    """v4 측정은 끝나지 않은 달의 일부만 받는다(T12)."""
+    seen = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(dict(request.url.params))
+        return httpx.Response(200, json=ok_body(hourly_items("2026-09", 3)))
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        items = weather.fetch_range(client, SECRET, date(2026, 9, 17), date(2026, 9, 25))
+    assert len(items) == 3
+    params = seen[0]
+    assert (params["startDt"], params["startHh"]) == ("20260917", "00")
+    assert (params["endDt"], params["endHh"]) == ("20260925", "23")
