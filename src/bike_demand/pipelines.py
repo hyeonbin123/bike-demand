@@ -12,6 +12,9 @@ from __future__ import annotations
 
 import calendar
 import os
+import time
+from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
@@ -38,6 +41,37 @@ def last_day(month: str) -> str:
 LOADED_MARKER = "loaded.txt"
 # 이보다 오래된 날은 매번 살피지 않는다. 그런 날은 원본 폴더를 보고 직접 다시 적재한다.
 RECOVER_DAYS = 7
+
+
+# 재생성·적재·기록 구간의 잠금. Airflow 실행과 수동 실행이 겹치면 한쪽이 옛 원본 목록으로 만든
+# Parquet이 다른 쪽의 Parquet을 덮어써, 새 원본을 적재하지 않고도 loaded.txt에 적을 수 있다(T42).
+LOCK_NAME = ".collect-realtime.lock"
+# 한 번 실행은 1분 안쪽이다. 이보다 오래된 잠금은 중단된 실행이 남긴 것으로 보고 지운다.
+STALE_LOCK_SECONDS = 30 * 60
+
+
+class LoadBusy(RuntimeError):
+    """다른 실행이 적재 중이다. Airflow 재시도나 다음 실행이 이어받는다."""
+
+
+@contextmanager
+def _load_lock(bronze_dir: Path) -> Iterator[None]:
+    bronze_dir.mkdir(parents=True, exist_ok=True)
+    lock = bronze_dir / LOCK_NAME
+    try:
+        if time.time() - lock.stat().st_mtime > STALE_LOCK_SECONDS:
+            lock.unlink(missing_ok=True)
+    except FileNotFoundError:
+        pass
+    try:
+        fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    except FileExistsError:
+        raise LoadBusy("다른 실시간 적재가 실행 중") from None
+    os.close(fd)
+    try:
+        yield
+    finally:
+        lock.unlink(missing_ok=True)
 
 
 def _raw_names(raw_dir: Path, day: date) -> list[str]:
@@ -74,24 +108,30 @@ def collect_realtime(
     DB 장애가 몇 시간 이어지면 수집 날짜가 이미 지나 있다(T35, T39). 그래서 날마다 적재에 성공한
     원본 이름을 bronze 폴더의 loaded.txt에 남기고, 최근 RECOVER_DAYS일 중 원본 목록과 기록이 다른
     날을 오늘과 함께 다시 적재한다. 적재는 이미 있는 행을 건너뛰므로 중복되지 않는다.
+    수집한 원본은 먼저 저장하고, 재생성부터 기록까지는 한 번에 한 실행만 한다(겹치면 LoadBusy).
+    7일보다 오래된 날은 매 실행이 살피지 않으므로 `realtime.to_parquet`로 Parquet을 다시 만든 뒤
+    `serving.load realtime --day`로 직접 적재한다.
     """
     collected_at = realtime._kst(now or datetime.now(realtime.KST))
     day = collected_at.date()
     path, status = realtime.download(raw_dir, service_key, collected_at, client=client)
-    past = [day - timedelta(days=n) for n in range(RECOVER_DAYS, 0, -1)]
-    pending = [d for d in past if _raw_names(raw_dir, d) not in ([], _loaded_names(bronze_dir, d))]
     result: dict = {"day": day.isoformat(), "raw": str(path), "status": status, "days": {}}
-    for target in [*pending, day]:
-        names = _raw_names(raw_dir, target)
-        parquet = bronze_dir / f"date={target:%Y-%m-%d}" / "snapshots.parquet"
-        rows = realtime.to_parquet(raw_dir, parquet, target)
-        snapshots, stations = load.load_realtime(engine, bronze_dir, target)
-        _mark_loaded(bronze_dir, target, names)
-        result["days"][target.isoformat()] = {
-            "parquet_rows": rows,
-            "snapshots_inserted": snapshots,
-            "new_stations": stations,
-        }
+    with _load_lock(bronze_dir):
+        past = [day - timedelta(days=n) for n in range(RECOVER_DAYS, 0, -1)]
+        pending = [
+            d for d in past if _raw_names(raw_dir, d) not in ([], _loaded_names(bronze_dir, d))
+        ]
+        for target in [*pending, day]:
+            names = _raw_names(raw_dir, target)
+            parquet = bronze_dir / f"date={target:%Y-%m-%d}" / "snapshots.parquet"
+            rows = realtime.to_parquet(raw_dir, parquet, target)
+            snapshots, stations = load.load_realtime(engine, bronze_dir, target)
+            _mark_loaded(bronze_dir, target, names)
+            result["days"][target.isoformat()] = {
+                "parquet_rows": rows,
+                "snapshots_inserted": snapshots,
+                "new_stations": stations,
+            }
     today = result["days"][day.isoformat()]
     result.update(
         parquet_rows=today["parquet_rows"],

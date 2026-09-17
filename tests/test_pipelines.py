@@ -137,3 +137,35 @@ def test_failures_through_the_midnight_hour_are_recovered_later(pg_engine, tmp_p
     with pg_engine.connect() as conn:
         count = conn.execute(select(func.count()).select_from(RealtimeSnapshot)).scalar_one()
     assert count == 8
+
+
+def test_overlapping_runs_do_not_rebuild_and_load_at_the_same_time(tmp_path, monkeypatch):
+    """적재 구간은 한 실행만: 잠금이 있으면 원본만 남기고 LoadBusy, 오래된 잠금은 지운다(T42)."""
+    import os
+    import time
+
+    import pytest
+
+    from bike_demand import pipelines
+
+    raw, bronze = tmp_path / "raw", tmp_path / "bronze"
+    client = httpx.Client(transport=httpx.MockTransport(bike_list))
+    at = datetime(2026, 9, 17, 12, 0, tzinfo=realtime.KST)
+    lock = bronze / pipelines.LOCK_NAME
+    bronze.mkdir(parents=True)
+    lock.touch()
+    monkeypatch.setattr(pipelines.load, "load_realtime", lambda *a: pytest.fail("적재하면 안 됨"))
+    with pytest.raises(pipelines.LoadBusy):
+        pipelines.collect_realtime(None, raw, bronze, SECRET, at, client)
+    assert len(list((raw / "date=2026-09-17").glob("*.json"))) == 1  # 수집분은 남음
+    assert lock.exists() and not (bronze / "date=2026-09-17" / "loaded.txt").exists()
+
+    old = time.time() - pipelines.STALE_LOCK_SECONDS - 60
+    os.utime(lock, (old, old))
+    monkeypatch.setattr(pipelines.load, "load_realtime", lambda *a: (2, 0))
+    later = datetime(2026, 9, 17, 12, 10, tzinfo=realtime.KST)
+    result = pipelines.collect_realtime(None, raw, bronze, SECRET, later, client)
+    assert result["days"]["2026-09-17"]["parquet_rows"] == 4
+    assert not lock.exists()
+    loaded = (bronze / "date=2026-09-17" / "loaded.txt").read_text(encoding="utf-8").split()
+    assert loaded == ["120000.json", "121000.json"]
