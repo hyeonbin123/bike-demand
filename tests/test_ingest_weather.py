@@ -232,8 +232,10 @@ def test_total_count_changing_between_pages_is_retried_then_fails(tmp_path, monk
     monkeypatch.setattr(weather, "PAGE_SIZE", 1)
     monkeypatch.setattr(weather.time, "sleep", lambda _: None)
     items = hourly_items("2023-01", 2)
+    pages: list[int] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
+        pages.append(int(request.url.params["pageNo"]))
         if request.url.params["pageNo"] == "1":
             return httpx.Response(200, json=ok_body(items[:1], total=2))
         return httpx.Response(200, json=ok_body([], total=0))
@@ -242,4 +244,6 @@ def test_total_count_changing_between_pages_is_retried_then_fails(tmp_path, monk
     raw = tmp_path / "raw"
     with pytest.raises(weather.ApiError, match="전체 건수가 쪽마다 다름"):
         list(weather.download(raw, ["2023-01"], SECRET, date(2023, 2, 10), client))
+    # 1쪽은 다시 받지 않고, 건수가 어긋난 2쪽만 세 번 시도한다(T40)
+    assert pages == [1, 2, 2, 2]
     assert not weather.raw_path(raw, "2023-01").exists()
