@@ -13,6 +13,7 @@ from __future__ import annotations
 import calendar
 import os
 import time
+import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import date, datetime, timedelta
@@ -43,10 +44,13 @@ LOADED_MARKER = "loaded.txt"
 RECOVER_DAYS = 7
 
 
-# 재생성·적재·기록 구간의 잠금. Airflow 실행과 수동 실행이 겹치면 한쪽이 옛 원본 목록으로 만든
-# Parquet이 다른 쪽의 Parquet을 덮어써, 새 원본을 적재하지 않고도 loaded.txt에 적을 수 있다(T42).
+# 재생성·적재·기록 구간의 잠금. 겹친 실행이 같은 날을 두 번 다시 만드는 낭비를 줄이는 용도다.
+# 적재가 빠지지 않는 것은 잠금에 기대지 않는다: 실행마다 자기 Parquet 파일을 만들어 그 파일을
+# 적재하고, loaded.txt에는 그 파일을 만들기 전에 본 원본 이름만 적는다(원본은 지워지지 않으므로
+# 적힌 이름은 모두 적재된 파일 안에 있다). 그래서 오래 걸린 실행의 잠금을 다른 실행이 가져가도
+# 기록이 적재보다 앞서지 않는다(T42, T44).
 LOCK_NAME = ".collect-realtime.lock"
-# 한 번 실행은 1분 안쪽이다. 이보다 오래된 잠금은 중단된 실행이 남긴 것으로 보고 지운다.
+# 한 번 실행은 1분 안쪽이다. 이보다 오래된 잠금은 중단된 실행이 남긴 것으로 보고 가져간다.
 STALE_LOCK_SECONDS = 30 * 60
 
 
@@ -56,6 +60,7 @@ class LoadBusy(RuntimeError):
 
 @contextmanager
 def _load_lock(bronze_dir: Path) -> Iterator[None]:
+    """잠금에 자기 표식을 적고, 풀 때는 표식이 그대로일 때만 지운다(가져간 실행의 잠금 보존)."""
     bronze_dir.mkdir(parents=True, exist_ok=True)
     lock = bronze_dir / LOCK_NAME
     try:
@@ -63,15 +68,21 @@ def _load_lock(bronze_dir: Path) -> Iterator[None]:
             lock.unlink(missing_ok=True)
     except FileNotFoundError:
         pass
+    token = uuid.uuid4().hex
     try:
         fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
     except FileExistsError:
         raise LoadBusy("다른 실시간 적재가 실행 중") from None
-    os.close(fd)
+    with os.fdopen(fd, "w", encoding="utf-8") as stream:
+        stream.write(token)
     try:
         yield
     finally:
-        lock.unlink(missing_ok=True)
+        try:
+            if lock.read_text(encoding="utf-8") == token:
+                lock.unlink(missing_ok=True)
+        except FileNotFoundError:
+            pass
 
 
 def _raw_names(raw_dir: Path, day: date) -> list[str]:
@@ -89,7 +100,7 @@ def _loaded_names(bronze_dir: Path, day: date) -> list[str] | None:
 
 def _mark_loaded(bronze_dir: Path, day: date, names: list[str]) -> None:
     path = _marker(bronze_dir, day)
-    tmp = path.with_suffix(".tmp")
+    tmp = path.with_name(f"{LOADED_MARKER}.{uuid.uuid4().hex}.tmp")
     tmp.write_text("".join(f"{name}\n" for name in names), encoding="utf-8", newline="\n")
     os.replace(tmp, path)
 
@@ -108,9 +119,10 @@ def collect_realtime(
     DB 장애가 몇 시간 이어지면 수집 날짜가 이미 지나 있다(T35, T39). 그래서 날마다 적재에 성공한
     원본 이름을 bronze 폴더의 loaded.txt에 남기고, 최근 RECOVER_DAYS일 중 원본 목록과 기록이 다른
     날을 오늘과 함께 다시 적재한다. 적재는 이미 있는 행을 건너뛰므로 중복되지 않는다.
-    수집한 원본은 먼저 저장하고, 재생성부터 기록까지는 한 번에 한 실행만 한다(겹치면 LoadBusy).
+    수집한 원본은 먼저 저장하고, 재생성부터 기록까지는 보통 한 번에 한 실행만 한다(겹치면 LoadBusy).
     7일보다 오래된 날은 매 실행이 살피지 않으므로 `realtime.to_parquet`로 Parquet을 다시 만든 뒤
-    `serving.load realtime --day`로 직접 적재한다.
+    `serving.load realtime --day`로 직접 적재한다. 이 수동 적재는 이미 있는 행을 건너뛸 뿐
+    loaded.txt를 쓰지 않으므로 수집 작업과 겹쳐도 기록이 어긋나지 않는다.
     """
     collected_at = realtime._kst(now or datetime.now(realtime.KST))
     day = collected_at.date()
@@ -124,8 +136,13 @@ def collect_realtime(
         for target in [*pending, day]:
             names = _raw_names(raw_dir, target)
             parquet = bronze_dir / f"date={target:%Y-%m-%d}" / "snapshots.parquet"
-            rows = realtime.to_parquet(raw_dir, parquet, target)
-            snapshots, stations = load.load_realtime(engine, bronze_dir, target)
+            own = parquet.with_name(f"snapshots.{uuid.uuid4().hex}.parquet.part")
+            try:
+                rows = realtime.to_parquet(raw_dir, own, target)
+                snapshots, stations = load.load_realtime_file(engine, own)
+                os.replace(own, parquet)
+            finally:
+                own.unlink(missing_ok=True)
             _mark_loaded(bronze_dir, target, names)
             result["days"][target.isoformat()] = {
                 "parquet_rows": rows,

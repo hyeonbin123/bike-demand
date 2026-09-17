@@ -92,8 +92,12 @@ def split_station_name(name: str | None) -> tuple[int | None, str | None]:
 
 
 def load_realtime(engine: Engine, bronze_dir: Path, day: date) -> tuple[int, int]:
-    """(새로 넣은 스냅샷 행 수, 새로 추가한 대여소 수)."""
-    path = bronze_dir / f"date={day:%Y-%m-%d}" / "snapshots.parquet"
+    """(새로 넣은 스냅샷 행 수, 새로 추가한 대여소 수). 그날의 bronze Parquet을 적재한다."""
+    return load_realtime_file(engine, bronze_dir / f"date={day:%Y-%m-%d}" / "snapshots.parquet")
+
+
+def load_realtime_file(engine: Engine, path: Path) -> tuple[int, int]:
+    """실시간 스냅샷 Parquet 파일 하나를 적재한다(수집 작업은 실행마다 따로 만든 파일을 넘긴다)."""
     records = pq.read_table(path).to_pylist()
     snapshots = [
         {
