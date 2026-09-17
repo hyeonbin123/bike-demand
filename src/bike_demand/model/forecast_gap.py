@@ -15,12 +15,12 @@ from __future__ import annotations
 import math
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
 import numpy as np
 
-from bike_demand.api.shortage import expected_rentals
+from bike_demand.api.shortage import expected_rentals, hours_overlapping
 from bike_demand.model.artifacts import Artifacts
 from bike_demand.model.frames import WEATHER_FEATURES
 from bike_demand.model.predict import feature_rows
@@ -84,9 +84,34 @@ def lead_bucket(hour_start: datetime, base: datetime) -> str | None:
     return None
 
 
+# 서비스 예측 작업은 발표 15분 뒤에 돈다(DAG `15 2,5,8…`). 대여소 집합은 그 전 6시간 안의 스냅샷,
+# 부족 목록은 그 전 30분 안의 스냅샷일 때만 만든다(서비스 예측·API 한도). v4 측정 전 보충.
+SERVICE_DELAY = timedelta(minutes=15)
+STATION_MAX_AGE = timedelta(hours=6)
+LIST_MAX_AGE = timedelta(minutes=30)
+GROUPS = ("all", "wet", "dry", "unknown")
+MISSING_WEATHER = dict.fromkeys(WEATHER_FEATURES, math.nan)
+
+
+def issue_as_of(base: datetime) -> datetime:
+    return base + SERVICE_DELAY
+
+
+def observed_end(last_issue: datetime) -> date:
+    """마지막 발표의 가장 긴 간격(48시간) 예보가 가리키는 관측 시각의 날짜."""
+    return (last_issue + 48 * HOUR).astimezone(KST).date()
+
+
+def check_fetchable(end: date, today: date) -> None:
+    if end >= today:
+        raise SystemExit(f"관측은 전날까지만 제공됨: {end} 다음 날 이후에 받는다")
+
+
 def _both(pairs, name):
     return [
-        (f[name], o[name]) for f, o in pairs if not (math.isnan(f[name]) or math.isnan(o[name]))
+        (h, f[name], o[name])
+        for h, f, o in pairs
+        if not (math.isnan(f[name]) or math.isnan(o[name]))
     ]
 
 
@@ -95,38 +120,38 @@ def _share(numerator: int, denominator: int) -> float | None:
 
 
 def _events(pairs, name: str) -> dict:
-    """0보다 크면 '있음'으로 본 일치율·재현율·정밀도."""
+    """0보다 크면 '있음'. 쌍 수와 고유한 관측 시각 수를 함께 적는다(같은 시각은 발표마다 한 쌍)."""
     both = _both(pairs, name)
-    fc = [f > 0 for f, _ in both]
-    ob = [o > 0 for _, o in both]
+    fc = [f > 0 for _, f, _ in both]
+    ob = [o > 0 for _, _, o in both]
     hits = sum(f and o for f, o in zip(fc, ob, strict=True))
     return {
         "n": len(both),
-        "observed_hours": sum(ob),
-        "forecast_hours": sum(fc),
+        "observed_pairs": sum(ob),
+        "observed_unique_hours": len({h for h, _, o in both if o > 0}),
+        "forecast_pairs": sum(fc),
         "agreement": _share(sum(f == o for f, o in zip(fc, ob, strict=True)), len(both)),
         "recall": _share(hits, sum(ob)),
         "precision": _share(hits, sum(fc)),
     }
 
 
-def _summarize(pairs: list[tuple[dict, dict]]) -> dict:
-    summary: dict = {"pairs": len(pairs)}
+def _summarize(pairs: list[tuple[datetime, dict, dict]]) -> dict:
+    summary: dict = {"pairs": len(pairs), "unique_hours": len({h for h, _, _ in pairs})}
     for name in CONTINUOUS:
-        both = _both(pairs, name)
-        diffs = [f - o for f, o in both]
+        diffs = [f - o for _, f, o in _both(pairs, name)]
         summary[name] = {
             "n": len(diffs),
             "mae": float(np.mean(np.abs(diffs))) if diffs else None,
             "bias": float(np.mean(diffs)) if diffs else None,
         }
     rain = _events(pairs, "rain_mm")
-    wet = [(f, o) for f, o in _both(pairs, "rain_mm") if o > 0]
-    rain["amount_mae_when_observed"] = float(np.mean([abs(f - o) for f, o in wet])) if wet else None
-    rain["reference_only"] = rain["observed_hours"] < MIN_RAIN_HOURS
+    wet = [abs(f - o) for _, f, o in _both(pairs, "rain_mm") if o > 0]
+    rain["amount_mae_when_observed"] = float(np.mean(wet)) if wet else None  # PCP 대표값 변환 뒤
+    rain["reference_only"] = rain["observed_unique_hours"] < MIN_RAIN_HOURS
     summary["rain"] = rain
     snow = _events(pairs, "is_snow")
-    snow["measurable"] = snow["observed_hours"] > 0
+    snow["measurable"] = snow["observed_unique_hours"] > 0
     summary["snow"] = snow
     return summary
 
@@ -138,6 +163,7 @@ def weather_errors(
     """(발표 시각, 그 발표의 hour_start별 예보 특징) 목록과 관측을 간격 구간별로 비교한다.
 
     같은 시각이 여러 발표에 들어 있으면 발표마다 따로 센다(서비스가 발표마다 다시 예측하므로).
+    관측 행이 없는 시각은 날씨 오차에서만 뺀다.
     """
     pairs: dict[str, list] = {name: [] for *_, name in LEAD_BUCKETS}
     for base, weather in issues:
@@ -145,8 +171,20 @@ def weather_errors(
             bucket = lead_bucket(hour_start, base)
             if bucket is None or hour_start not in observed:
                 continue
-            pairs[bucket].append((forecast, observed[hour_start]))
+            pairs[bucket].append((hour_start, forecast, observed[hour_start]))
     return {name: _summarize(values) for name, values in pairs.items()}
+
+
+def rain_state(observed: dict[datetime, dict[str, float]], hours: Iterable[datetime]) -> str:
+    """관측 기준 비 옴 구분: 하나라도 비 → wet, 아니면 하나라도 관측 없음 → unknown, 그 밖 dry."""
+    missing = False
+    for hour in hours:
+        values = observed.get(hour)
+        if values is None:
+            missing = True
+        elif values["rain_mm"] > 0:
+            return "wet"
+    return "unknown" if missing else "dry"
 
 
 def predict_both(
@@ -158,10 +196,14 @@ def predict_both(
     artifacts: Artifacts,
     features: list[str],
 ) -> tuple[list[tuple[str, datetime]], np.ndarray, np.ndarray]:
-    """같은 대여소·시각을 예보 날씨와 관측 날씨로 각각 예측한다. 날씨 외 특징이 다르면 오류."""
-    hours = [h for h in hours if h in forecast and h in observed]
+    """같은 대여소·시각을 예보 날씨와 관측 날씨로 각각 예측한다. 날씨 외 특징이 다르면 오류.
+
+    예보가 있는 시각은 모두 쓴다. 관측 행이 없는 시각은 날씨 5개를 결측으로 둔다(보충 T46).
+    """
+    hours = [h for h in hours if h in forecast]
+    observed_weather = {h: observed.get(h, MISSING_WEATHER) for h in hours}
     by_forecast, keys = feature_rows(stations, hours, forecast, artifacts, features)
-    by_observed, _ = feature_rows(stations, hours, observed, artifacts, features)
+    by_observed, _ = feature_rows(stations, hours, observed_weather, artifacts, features)
     others = [i for i, name in enumerate(features) if name not in WEATHER_FEATURES]
     if not np.array_equal(by_forecast[:, others], by_observed[:, others], equal_nan=True):
         raise AssertionError("날씨 외 특징이 두 예측에서 다름")
@@ -170,32 +212,44 @@ def predict_both(
     return keys, np.asarray(predict(by_forecast)), np.asarray(predict(by_observed))
 
 
+def _zeros(kind=float):
+    return dict.fromkeys(GROUPS, kind())
+
+
 @dataclass
 class ShiftTotals:
-    """여러 발표에 걸친 예측 흔들림 합계. 비 옴은 관측 기준."""
+    """여러 발표에 걸친 예측 흔들림 합계. 무리(all·wet·dry·unknown)는 관측 강수 기준(보충 T49)."""
 
-    abs_diff: dict[str, float] = field(default_factory=lambda: {"all": 0.0, "wet": 0.0, "dry": 0.0})
-    rows: dict[str, int] = field(default_factory=lambda: {"all": 0, "wet": 0, "dry": 0})
-    forecast_sum: float = 0.0
-    observed_sum: float = 0.0
-    abs_diff_3h: float = 0.0
-    stations_3h: int = 0
-    overlaps: list[float] = field(default_factory=list)
+    abs_diff: dict[str, float] = field(default_factory=_zeros)
+    rows: dict[str, int] = field(default_factory=lambda: _zeros(int))
+    forecast_sum: dict[str, float] = field(default_factory=_zeros)
+    observed_sum: dict[str, float] = field(default_factory=_zeros)
+    abs_diff_3h: dict[str, float] = field(default_factory=_zeros)
+    stations_3h: dict[str, int] = field(default_factory=lambda: _zeros(int))
+    issues: dict[str, int] = field(default_factory=lambda: _zeros(int))
+    overlaps: dict[str, list[float]] = field(default_factory=lambda: {g: [] for g in GROUPS})
+    lists_skipped: dict[str, int] = field(
+        default_factory=lambda: {"no_recent_snapshot": 0, "empty_forecast_list": 0}
+    )
 
     def add(
         self, keys, by_forecast, by_observed, observed, as_of, bike_counts, top_n=50, horizon=3
     ):
+        """bike_counts=None이면(30분 안 스냅샷 없음) 부족 목록 비교만 뺀다."""
+        window = rain_state(observed, hours_overlapping(as_of, horizon))
+        for group in ("all", window):
+            self.issues[group] += 1
         hourly_f: dict[str, dict[datetime, float]] = {}
         hourly_o: dict[str, dict[datetime, float]] = {}
         for (station_id, hour_start), f, o in zip(keys, by_forecast, by_observed, strict=True):
-            kind = "wet" if observed[hour_start]["rain_mm"] > 0 else "dry"
-            for group in ("all", kind):
-                self.abs_diff[group] += abs(float(f) - float(o))
+            f, o = float(f), float(o)
+            for group in ("all", rain_state(observed, [hour_start])):
+                self.abs_diff[group] += abs(f - o)
                 self.rows[group] += 1
-            self.forecast_sum += float(f)
-            self.observed_sum += float(o)
-            hourly_f.setdefault(station_id, {})[hour_start] = float(f)
-            hourly_o.setdefault(station_id, {})[hour_start] = float(o)
+                self.forecast_sum[group] += f
+                self.observed_sum[group] += o
+            hourly_f.setdefault(station_id, {})[hour_start] = f
+            hourly_o.setdefault(station_id, {})[hour_start] = o
         expected_f, expected_o = {}, {}
         for station_id in hourly_f:
             ef = expected_rentals(as_of, horizon, hourly_f[station_id])
@@ -203,33 +257,43 @@ class ShiftTotals:
             if ef is None or eo is None:
                 continue
             expected_f[station_id], expected_o[station_id] = ef, eo
-            self.abs_diff_3h += abs(ef - eo)
-            self.stations_3h += 1
-        if bike_counts is not None:
-            listed_f = top_shortage(bike_counts, expected_f, top_n)
-            listed_o = top_shortage(bike_counts, expected_o, top_n)
-            if listed_f:
-                self.overlaps.append(len(set(listed_f) & set(listed_o)) / len(listed_f))
+            for group in ("all", window):
+                self.abs_diff_3h[group] += abs(ef - eo)
+                self.stations_3h[group] += 1
+        if bike_counts is None:
+            self.lists_skipped["no_recent_snapshot"] += 1
+            return
+        listed_f = top_shortage(bike_counts, expected_f, top_n)
+        listed_o = top_shortage(bike_counts, expected_o, top_n)
+        if not listed_f:
+            self.lists_skipped["empty_forecast_list"] += 1
+            return
+        overlap = len(set(listed_f) & set(listed_o)) / len(listed_f)
+        for group in ("all", window):
+            self.overlaps[group].append(overlap)
 
     def report(self) -> dict:
-        def mean(group):
-            return self.abs_diff[group] / self.rows[group] if self.rows[group] else None
+        def ratio(numerator, denominator):
+            return numerator / denominator if denominator else None
 
         return {
-            "rows": dict(self.rows),
-            "mean_abs_diff": {g: mean(g) for g in ("all", "wet", "dry")},
-            "mean_ratio_forecast_over_observed": (
-                self.forecast_sum / self.observed_sum if self.observed_sum else None
-            ),
-            "mean_abs_diff_3h_sum": (
-                self.abs_diff_3h / self.stations_3h if self.stations_3h else None
-            ),
-            "top50_overlap": {
-                "issues": len(self.overlaps),
-                "mean": float(np.mean(self.overlaps)) if self.overlaps else None,
-                "min": float(np.min(self.overlaps)) if self.overlaps else None,
-            },
-        }
+            group: {
+                "rows": self.rows[group],
+                "mean_abs_diff": ratio(self.abs_diff[group], self.rows[group]),
+                "mean_ratio_forecast_over_observed": ratio(
+                    self.forecast_sum[group], self.observed_sum[group]
+                ),
+                "issues": self.issues[group],
+                "stations_3h": self.stations_3h[group],
+                "mean_abs_diff_3h_sum": ratio(self.abs_diff_3h[group], self.stations_3h[group]),
+                "top50_overlap": {
+                    "issues": len(self.overlaps[group]),
+                    "mean": float(np.mean(self.overlaps[group])) if self.overlaps[group] else None,
+                    "min": float(np.min(self.overlaps[group])) if self.overlaps[group] else None,
+                },
+            }
+            for group in GROUPS
+        } | {"lists_skipped": dict(self.lists_skipped)}
 
 
 def top_shortage(bike_counts: dict[str, int], expected: dict[str, float], n: int) -> list[str]:
@@ -247,7 +311,6 @@ if __name__ == "__main__":
     import argparse
     import json
     import os
-    from datetime import date
     from pathlib import Path
 
     import httpx
@@ -276,9 +339,8 @@ if __name__ == "__main__":
         key = os.environ.get("DATA_GO_KR_SERVICE_KEY")
         if not key:
             raise SystemExit(".env에 DATA_GO_KR_SERVICE_KEY가 없음")
-        end = (last + timedelta(hours=49)).date()
-        if end >= date.today():
-            raise SystemExit(f"관측은 전날까지만 제공됨: {end} 다음 날 이후에 받는다")
+        end = observed_end(last)
+        check_fetchable(end, datetime.now(KST).date())
         with httpx.Client(timeout=30) as client:
             items = asos.fetch_range(client, key, first.date(), end)
         args.observed.parent.mkdir(parents=True, exist_ok=True)
@@ -289,13 +351,14 @@ if __name__ == "__main__":
     engine = make_engine()
     generation, booster, artifacts = load_serving_model(args.models)
     features = booster.feature_name()
-    issues, skipped = [], {"no_snapshot": []}
+    issues, skipped = [], {"no_stations": []}
     totals = ShiftTotals()
+    grid = (WeatherForecast.nx == 60) & (WeatherForecast.ny == 127)
     with engine.connect() as conn:
         bases = (
             conn.execute(
                 select(WeatherForecast.base_datetime)
-                .where(WeatherForecast.base_datetime.between(first, last))
+                .where(grid, WeatherForecast.base_datetime.between(first, last))
                 .distinct()
                 .order_by(WeatherForecast.base_datetime)
             )
@@ -306,18 +369,19 @@ if __name__ == "__main__":
             rows = conn.execute(
                 select(
                     WeatherForecast.fcst_datetime, WeatherForecast.category, WeatherForecast.value
-                ).where(WeatherForecast.base_datetime == base)
+                ).where(grid, WeatherForecast.base_datetime == base)
             ).all()
             forecast = hourly_weather((r[0], r[1], r[2]) for r in rows)
             issues.append((base, forecast))
+            as_of = issue_as_of(base).astimezone(KST)
             snapshot_at = conn.execute(
                 select(RealtimeSnapshot.fetched_at)
-                .where(RealtimeSnapshot.fetched_at.between(base, base + timedelta(minutes=30)))
-                .order_by(RealtimeSnapshot.fetched_at)
+                .where(RealtimeSnapshot.fetched_at.between(as_of - STATION_MAX_AGE, as_of))
+                .order_by(RealtimeSnapshot.fetched_at.desc())
                 .limit(1)
             ).scalar_one_or_none()
             if snapshot_at is None:
-                skipped["no_snapshot"].append(base.isoformat())
+                skipped["no_stations"].append(base.isoformat())
                 continue
             snapshot = conn.execute(
                 select(Station.station_id, Station.district, Station.docks, Station.lat,
@@ -327,15 +391,17 @@ if __name__ == "__main__":
                 .order_by(Station.station_id)
             ).mappings().all()  # fmt: skip
             stations = [dict(r) for r in snapshot]
-            as_of = snapshot_at.astimezone(KST)
             first_hour = as_of.replace(minute=0, second=0, microsecond=0)
             hours = [first_hour + i * HOUR for i in range(48)]
             keys, by_f, by_o = predict_both(
                 booster.predict, stations, hours, forecast, observed, artifacts, features
             )
-            bikes = {r["station_id"]: r["bike_count"] for r in stations}
+            recent = as_of - snapshot_at <= LIST_MAX_AGE
+            bikes = {r["station_id"]: r["bike_count"] for r in stations} if recent else None
             totals.add(keys, by_f, by_o, observed, as_of, bikes)
-            print(base.astimezone(KST).isoformat(), len(keys), flush=True)
+            print(
+                base.astimezone(KST).isoformat(), len(keys), "list" if recent else "-", flush=True
+            )
 
     expected_issues = int((last - first) / timedelta(hours=3)) + 1
     report = {

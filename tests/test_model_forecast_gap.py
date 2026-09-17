@@ -1,7 +1,7 @@
 """v4(T12) 측정 계산. 실제 API·DB·모델 없이 합성 자료로 확인한다."""
 
 import math
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 import duckdb
@@ -101,19 +101,42 @@ def test_weather_errors_by_lead_bucket():
     assert short["pairs"] == 4 and report["7-24h"]["pairs"] == 0
     assert short["temp_c"] == {"n": 3, "mae": pytest.approx(2 / 3), "bias": pytest.approx(0.0)}
     rain = short["rain"]
-    assert (rain["observed_hours"], rain["forecast_hours"]) == (2, 2)
+    assert rain["observed_pairs"] == rain["observed_unique_hours"] == rain["forecast_pairs"] == 2
     assert rain["agreement"] == 0.5 and rain["recall"] == 0.5 and rain["precision"] == 0.5
     assert rain["amount_mae_when_observed"] == pytest.approx((2.0 + 0.5) / 2)
     assert rain["reference_only"] is True
     assert short["snow"]["measurable"] is False and short["snow"]["recall"] is None
 
 
-def test_predictions_differ_only_through_weather(small_warehouse, tmp_path):
+def test_rain_guard_counts_distinct_hours_not_issue_pairs():
+    """같은 비 온 두 시간을 발표 8개가 담아도 고유 시각은 2라 참고용으로 남는다(T47)."""
+    target = [datetime(2026, 9, 20, 12, tzinfo=KST) + timedelta(hours=i) for i in range(2)]
+    observed = {h: weather(20.0, 2.0) for h in target}
+    issues = []
+    for n in range(8):
+        base = target[0] - timedelta(hours=26 + 2 * n)  # 간격 27~42시간
+        issues.append((base, {h: weather(20.0, 1.0) for h in target}))
+    rain = forecast_gap.weather_errors(issues, observed)["25-48h"]["rain"]
+    assert rain["observed_pairs"] == 16 >= forecast_gap.MIN_RAIN_HOURS
+    assert rain["observed_unique_hours"] == 2 and rain["reference_only"] is True
+
+
+def test_observed_download_ends_with_the_longest_lead_and_waits_a_day():
+    """기본 마지막 발표 09-23 23시 → 관측 09-25까지. 09-26에는 받고 09-25에는 거부(T48)."""
+    end = forecast_gap.observed_end(datetime(2026, 9, 23, 23, tzinfo=KST))
+    assert end == date(2026, 9, 25)
+    forecast_gap.check_fetchable(end, date(2026, 9, 26))
+    with pytest.raises(SystemExit):
+        forecast_gap.check_fetchable(end, date(2026, 9, 25))
+
+
+def test_predictions_keep_hours_without_observations(small_warehouse, tmp_path):
+    """관측 행이 없는 시각도 빼지 않고 날씨만 결측으로 둔다. 날씨 외 특징은 같다(T46)."""
     artifacts.export(small_warehouse, ("2024-01-01", "2024-01-16"), tmp_path)
     loaded = artifacts.load(tmp_path)
     hours = [datetime(2024, 1, 16, h, tzinfo=KST) for h in range(3)]
     forecast = {h: weather(10.0, 0.0) for h in hours}
-    observed = {h: weather(12.0, 1.0) for h in hours[:2]}  # 마지막 시간은 관측 없음
+    observed = {h: weather(12.0, 1.0) for h in hours[:2]}  # 마지막 시간은 관측 행 없음
     features = frames.FEATURES
     temp = features.index("temp_c")
 
@@ -124,12 +147,14 @@ def test_predictions_differ_only_through_weather(small_warehouse, tmp_path):
         predict, [{"station_id": "ST-1"}, {"station_id": "ST-2"}], hours, forecast, observed,
         loaded, features,
     )  # fmt: skip
-    assert len(keys) == 4 and {h for _, h in keys} == set(hours[:2])
+    assert len(keys) == 6 and {h for _, h in keys} == set(hours)
     np.testing.assert_array_equal(by_f, 10.0)
-    np.testing.assert_array_equal(by_o, 12.0)
+    missing = np.array([h == hours[2] for _, h in keys])
+    np.testing.assert_array_equal(by_o[~missing], 12.0)
+    assert np.isnan(by_o[missing]).all()
 
 
-def test_shift_totals_and_top_shortage_follow_the_api_order():
+def test_shift_totals_split_by_rain_and_follow_the_api_order():
     as_of = datetime(2026, 9, 17, 8, 30, tzinfo=KST)
     hours = [datetime(2026, 9, 17, 8 + i, tzinfo=KST) for i in range(4)]
     keys = [(s, h) for s in ("A", "B", "C") for h in hours]
@@ -140,12 +165,37 @@ def test_shift_totals_and_top_shortage_follow_the_api_order():
     totals = forecast_gap.ShiftTotals()
     totals.add(keys, by_f, by_o, observed, as_of, bikes, top_n=1)
     report = totals.report()
-    assert report["rows"] == {"all": 12, "wet": 3, "dry": 9}
-    assert report["mean_abs_diff"]["all"] == pytest.approx(4 / 12)
-    assert report["mean_abs_diff"]["wet"] == pytest.approx(1 / 3)
-    assert report["mean_ratio_forecast_over_observed"] == pytest.approx(24 / 20)
-    # 3시간 합: 8시 절반 + 9·10시 + 11시 절반 = 3시간치. A만 차이(6 - 3)
-    assert report["mean_abs_diff_3h_sum"] == pytest.approx(3 / 3)
+    assert report["all"]["rows"] == 12
+    assert (report["wet"]["rows"], report["dry"]["rows"], report["unknown"]["rows"]) == (3, 9, 0)
+    assert report["all"]["mean_abs_diff"] == pytest.approx(4 / 12)
+    assert report["wet"]["mean_abs_diff"] == pytest.approx(1 / 3)
+    assert report["all"]["mean_ratio_forecast_over_observed"] == pytest.approx(24 / 20)
+    assert report["wet"]["mean_ratio_forecast_over_observed"] == pytest.approx(6 / 5)
+    # 3시간 합: 8시 절반 + 9·10시 + 11시 절반. A만 차이(6 - 3). 8시에 비가 와 이 발표는 wet
+    assert report["all"]["mean_abs_diff_3h_sum"] == pytest.approx(3 / 3)
+    assert report["wet"]["issues"] == 1 and report["wet"]["stations_3h"] == 3
+    assert report["dry"]["issues"] == 0 and report["dry"]["mean_abs_diff_3h_sum"] is None
     # 예보: A 6-0=6이 1위. 관측: A 3과 B 3이 같아 대여소ID 순으로 A. C는 9-9=0이라 빠짐
-    assert report["top50_overlap"] == {"issues": 1, "mean": 1.0, "min": 1.0}
+    assert report["all"]["top50_overlap"] == {"issues": 1, "mean": 1.0, "min": 1.0}
+    assert report["wet"]["top50_overlap"]["issues"] == 1
     assert forecast_gap.top_shortage(bikes, {"A": 3.0, "B": 3.0, "C": 9.0}, 5) == ["A", "B"]
+
+
+def test_shift_totals_without_recent_snapshot_or_observations():
+    """30분 안 스냅샷이 없으면 목록 비교만 빼고, 관측 없는 시간은 unknown으로 센다(T46, T49)."""
+    as_of = datetime(2026, 9, 17, 8, 15, tzinfo=KST)
+    hours = [datetime(2026, 9, 17, 8 + i, tzinfo=KST) for i in range(4)]
+    keys = [("A", h) for h in hours]
+    observed = {h: weather(20.0, 0.0) for h in hours[:2]}  # 10·11시 관측 행 없음
+    totals = forecast_gap.ShiftTotals()
+    totals.add(keys, np.full(4, 2.0), np.full(4, 1.0), observed, as_of, None)
+    report = totals.report()
+    assert (report["dry"]["rows"], report["unknown"]["rows"]) == (2, 2)
+    assert report["unknown"]["issues"] == 1 and report["unknown"]["stations_3h"] == 1
+    assert report["all"]["mean_abs_diff_3h_sum"] == pytest.approx(3.0)
+    assert report["all"]["top50_overlap"]["issues"] == 0
+    assert report["lists_skipped"] == {"no_recent_snapshot": 1, "empty_forecast_list": 0}
+
+    empty = forecast_gap.ShiftTotals()
+    empty.add(keys, np.full(4, 2.0), np.full(4, 1.0), observed, as_of, {"A": 99})
+    assert empty.report()["lists_skipped"] == {"no_recent_snapshot": 0, "empty_forecast_list": 1}
