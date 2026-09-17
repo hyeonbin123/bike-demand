@@ -43,9 +43,10 @@ def test_serving_features_match_training_features(small_warehouse, tmp_path):
 def test_serving_level_features_match_training(two_year_warehouse, tmp_path):
     """v2 수준 특징도 학습 행과 서비스 행이 같아야 한다(공개 반기 경계가 있는 달들)."""
     history = ("2023-01-01", "2025-01-01")
-    artifacts.export(two_year_warehouse, history, tmp_path, with_levels=True)
+    meta = artifacts.export(two_year_warehouse, history, tmp_path, with_levels=True)
     loaded = artifacts.load(tmp_path)
     features = [*frames.FEATURES, *frames.LEVEL_FEATURES]
+    assert meta["features"] == features
     for day in ("2023-05-10", "2023-08-01", "2024-07-31", "2024-08-01", "2025-03-15"):
         next_day = (date.fromisoformat(day) + timedelta(days=1)).isoformat()
         window = frames.Window(rows=(day, next_day), history=history)

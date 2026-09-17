@@ -16,7 +16,7 @@ from pathlib import Path
 import duckdb
 import pyarrow.parquet as pq
 
-from bike_demand.model.frames import FEATURES, LEVEL_CTES, history_ctes
+from bike_demand.model.frames import FEATURES, LEVEL_CTES, LEVEL_FEATURES, history_ctes
 
 
 def export(
@@ -46,7 +46,7 @@ def export(
     meta = {
         "history": list(history),
         "global_trend": global_trend,
-        "features": FEATURES,
+        "features": [*FEATURES, *LEVEL_FEATURES] if with_levels else FEATURES,
         "with_levels": with_levels,
     }
     (out_dir / "meta.json").write_text(json.dumps(meta, ensure_ascii=False, indent=2), "utf-8")
