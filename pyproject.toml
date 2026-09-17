@@ -47,4 +47,4 @@ known-first-party = ["bike_demand", "bike_common"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "--basetemp=work/pytest-tmp"
+addopts = "--basetemp=.pytest-tmp"  # 기본 임시 폴더는 이 PC에서 권한 오류. 새 클론에도 있는 위치여야 함
