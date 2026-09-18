@@ -474,3 +474,40 @@ def test_httpcore_debug_headers_cannot_leak_request_key(caplog):
             forecast.fetch_forecast(client, SECRET, BASE, retries=1)
     assert SECRET not in caplog.text
     assert forecast.ENDPOINT not in caplog.text
+
+
+def test_recent_bases_cover_the_last_day_oldest_first():
+    """PC가 밤새 꺼졌다 켜져도 하루 안쪽의 빠진 발표를 채운다."""
+    now = datetime(2026, 9, 18, 8, 20, tzinfo=forecast.KST)
+    bases = forecast.recent_bases(now)
+    assert [f"{b:%d %H}" for b in bases] == [
+        "17 11", "17 14", "17 17", "17 20", "17 23", "18 02", "18 05", "18 08",
+    ]  # fmt: skip
+    # 제공 10분 전이면 최신은 직전 발표
+    assert forecast.recent_bases(datetime(2026, 9, 18, 8, 5, tzinfo=forecast.KST))[-1].hour == 5
+
+
+def test_download_recent_skips_existing_and_only_fails_on_the_latest(tmp_path, monkeypatch):
+    now = datetime(2026, 9, 18, 8, 20, tzinfo=forecast.KST)
+    seen = []
+
+    def fake_download(raw_dir, key, base, *, now, client, nx, ny):
+        seen.append(base.hour)
+        if base.hour == 2:
+            raise forecast.ApiError("지난 발표 실패")
+        return raw_dir / "x.json", "exists" if base.day == 17 else "saved 900"
+
+    monkeypatch.setattr(forecast, "download", fake_download)
+    results = forecast.download_recent(tmp_path, SECRET, now=now)
+    assert len(seen) == 8 and seen[-1] == 8
+    assert dict((b.hour, s) for b, s in results)[2].startswith("failed")
+    assert results[-1][1] == "saved 900"
+
+    def latest_fails(raw_dir, key, base, *, now, client, nx, ny):
+        if base.hour == 8:
+            raise forecast.ApiError("최신 발표 실패")
+        return raw_dir / "x.json", "exists"
+
+    monkeypatch.setattr(forecast, "download", latest_fails)
+    with pytest.raises(forecast.ApiError, match="최신"):
+        forecast.download_recent(tmp_path, SECRET, now=now)

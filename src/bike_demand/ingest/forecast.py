@@ -67,6 +67,48 @@ def latest_base(now: datetime) -> datetime:
     return (available - timedelta(days=1)).replace(hour=23, minute=0, second=0, microsecond=0)
 
 
+def recent_bases(now: datetime, hours: int = 24) -> list[datetime]:
+    """지금 받을 수 있는 최신 발표와 그 전 `hours`시간 안의 발표들(오래된 것부터).
+
+    API는 지난 발표도 하루 안쪽이면 준다. PC나 Docker가 꺼져 빠진 발표를 다음 실행이 채운다.
+    """
+    latest = latest_base(now)
+    bases = []
+    candidate = latest
+    while latest - candidate < timedelta(hours=hours):
+        bases.append(candidate)
+        previous = candidate - timedelta(hours=1)
+        candidate = latest_base(previous + timedelta(minutes=10))
+    return bases[::-1]
+
+
+def download_recent(
+    raw_dir: Path,
+    service_key: str,
+    *,
+    now: datetime | None = None,
+    client: httpx.Client | None = None,
+    nx: int = SEOUL_NX,
+    ny: int = SEOUL_NY,
+) -> list[tuple[datetime, str]]:
+    """최근 24시간 발표 중 없는 것을 받는다. 지난 발표가 실패하면 적어 두고 넘어가고,
+    최신 발표가 실패할 때만 오류를 낸다(최신 예보가 서비스에 필요하므로)."""
+    fetched_at = _kst(now if now is not None else datetime.now(KST))
+    bases = recent_bases(fetched_at)
+    results = []
+    for base in bases:
+        try:
+            _, status = download(
+                raw_dir, service_key, base, now=fetched_at, client=client, nx=nx, ny=ny
+            )
+        except ApiError as exc:
+            if base == bases[-1]:
+                raise
+            status = f"failed: {exc}"
+        results.append((base, status))
+    return results
+
+
 def _base(value: datetime) -> datetime:
     base = _kst(value)
     if base.hour not in BASE_HOURS or base.minute or base.second or base.microsecond:
@@ -348,6 +390,9 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="기상청 단기예보 한 발표를 모든 쪽과 함께 수집")
     parser.add_argument("--base-date", help="YYYYMMDD (--base-time과 함께 지정)")
     parser.add_argument("--base-time", help="HHMM (--base-date와 함께 지정)")
+    parser.add_argument(
+        "--catch-up", action="store_true", help="최신 발표와 지난 24시간의 빠진 발표를 받는다"
+    )
     parser.add_argument("--nx", type=int, default=SEOUL_NX)
     parser.add_argument("--ny", type=int, default=SEOUL_NY)
     parser.add_argument("--raw", type=Path, default=Path("data/raw/weather/vilage_fcst"))
@@ -359,10 +404,16 @@ if __name__ == "__main__":
     key = os.environ.get("DATA_GO_KR_SERVICE_KEY")
     if not key:
         raise SystemExit(".env에 DATA_GO_KR_SERVICE_KEY가 없음 (.env.example 참고)")
+    if args.catch_up and args.base_date:
+        parser.error("--catch-up은 --base-date와 함께 쓰지 않는다")
     try:
-        chosen = _datetime(args.base_date, args.base_time) if args.base_date else None
-        path, status = download(args.raw, key, chosen, nx=args.nx, ny=args.ny)
-        print(path.name, status, flush=True)
+        if args.catch_up:
+            for base, status in download_recent(args.raw, key, nx=args.nx, ny=args.ny):
+                print(f"{base:%Y%m%d%H%M}", status, flush=True)
+        else:
+            chosen = _datetime(args.base_date, args.base_time) if args.base_date else None
+            path, status = download(args.raw, key, chosen, nx=args.nx, ny=args.ny)
+            print(path.name, status, flush=True)
         print("parquet rows", to_parquet(args.raw, args.out))
     except (ApiError, ValueError) as exc:
         raise SystemExit(str(exc)) from None

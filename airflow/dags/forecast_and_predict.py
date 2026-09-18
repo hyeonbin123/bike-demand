@@ -18,7 +18,9 @@ with DAG(
     default_args=DEFAULT_ARGS,
     tags=["bike-demand", "collect", "predict"],
 ) as dag:
-    fetch = BashOperator(task_id="fetch_forecast", bash_command=py("bike_demand.ingest.forecast"))
+    fetch = BashOperator(
+        task_id="fetch_forecast", bash_command=py("bike_demand.ingest.forecast --catch-up")
+    )
     load = BashOperator(
         task_id="load_forecast",
         bash_command=py("bike_demand.serving.load forecasts"),
