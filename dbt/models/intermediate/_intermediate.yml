@@ -43,3 +43,23 @@ unit_tests:
         select 'ST-1' as station_id, h as hour_start,
                case when h = timestamp '2025-01-01 08:00:00' then 2 else 0 end as rentals
         from unnest(generate_series(timestamp '2025-01-01 00:00:00', timestamp '2025-01-02 23:00:00', interval 1 hour)) as t(h)
+
+  - name: grid_stops_at_the_calendar_end
+    description: "자료 마지막 날 밤 대여의 반납이 다음 날에 있어도 격자는 달력 끝에서 끝난다(T53)"
+    model: int_station_hour_grid
+    given:
+      - input: ref('fct_station_hourly')
+        rows:
+          - {station_id: ST-1, hour_start: "2026-06-30 22:00:00", rentals: 1, returns: 0}
+          - {station_id: ST-1, hour_start: "2026-07-01 00:00:00", rentals: 0, returns: 1}
+          - {station_id: ST-2, hour_start: "2026-07-01 01:00:00", rentals: 0, returns: 1}
+      - input: ref('dim_stations')
+        rows:
+          - {station_id: ST-1, total_rentals: 1}
+          - {station_id: ST-2, total_rentals: 5}
+    expect:
+      format: sql
+      rows: |
+        select 'ST-1' as station_id, h as hour_start,
+               case when h = timestamp '2026-06-30 22:00:00' then 1 else 0 end as rentals
+        from unnest(generate_series(timestamp '2026-06-30 00:00:00', timestamp '2026-06-30 23:00:00', interval 1 hour)) as t(h)

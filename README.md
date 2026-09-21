@@ -109,6 +109,8 @@ docker compose --profile airflow up -d --build          # Airflow 웹 화면 htt
 | `forecast_and_predict` | 02·05·…·23시 15분 | 단기예보 → `weather_forecasts` → 앞으로 48시간 예측 `predictions` |
 | `refresh_history` | 수동 | 새 반기 원본 변환 → ASOS → dbt build → 대여소 갱신 |
 
+`refresh_history`로 새 반기 자료를 넣은 뒤에는 `model.final serving`으로 서비스 모델과 학습 산출물(대여소 패턴, 반기 수준)을 다시 만든다. 다시 만들지 않은 채 다음 반기의 공개 시점을 넘기면 최근 수준 특징은 결측으로 들어간다.
+
 DAG는 처음에 멈춘 상태로 만들어지므로 웹 화면이나 `docker compose exec airflow-scheduler airflow dags unpause <dag_id>`로 켠다. 프로젝트 패키지는 Airflow 이미지 안의 별도 가상환경(`/opt/bike/.venv`)에 설치되어 Airflow 의존성과 섞이지 않는다. 컨테이너는 Docker가 다시 시작되면 같이 올라온다. 멈추려면 `docker compose --profile airflow stop`.
 
 ### API

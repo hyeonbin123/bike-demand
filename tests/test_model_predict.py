@@ -137,3 +137,28 @@ def test_predict_refuses_stale_snapshot(pg_engine, small_warehouse, tmp_path):
         )  # fmt: skip
     with pytest.raises(RuntimeError, match="스냅샷"):
         predict.predict_and_store(pg_engine, tiny_booster(), artifacts.load(tmp_path), "v", now)
+
+
+def test_stale_artifacts_give_missing_level_features_not_a_partial_half():
+    """자료 끝(2026-07-01) 뒤에 걸친 반기는 0건인 하루만 집계돼 있을 수 있다. 산출물을 갱신하지 않고
+    그 반기의 공개 시점(2027-02)을 넘겨도 그 값을 최근 수준으로 읽지 않는다(T53)."""
+    h1_2026 = (2026 * 12 + 0) // 6
+    stale = artifacts.Artifacts(
+        stations={}, district_codes={}, profile={}, trend={}, global_trend=None,
+        max_station_code=0,
+        halves={("ST-1", h1_2026): 4.0, ("ST-1", h1_2026 - 2): 2.0, ("ST-1", h1_2026 + 1): 0.0},
+        system_halves={h1_2026: 400.0, h1_2026 - 2: 200.0, h1_2026 + 1: 0.0},
+        history_end=date(2026, 7, 1),
+    )  # fmt: skip
+    now = predict.level_features("ST-1", datetime(2026, 9, 21, 8, tzinfo=KST), stale)
+    assert now == {"station_recent_mean": 4.0, "station_recent_ratio": 2.0,
+                   "system_recent_ratio": 2.0}  # fmt: skip
+    later = predict.level_features("ST-1", datetime(2027, 2, 1, 8, tzinfo=KST), stale)
+    assert all(np.isnan(value) for value in later.values())
+    # 자료 끝을 모르는 예전 산출물은 그대로 읽는다
+    legacy = artifacts.Artifacts(
+        stations={}, district_codes={}, profile={}, trend={}, global_trend=None,
+        max_station_code=0, halves={("ST-1", h1_2026 + 1): 0.0},
+    )  # fmt: skip
+    old_way = predict.level_features("ST-1", datetime(2027, 2, 1, 8, tzinfo=KST), legacy)
+    assert old_way["station_recent_mean"] == 0.0

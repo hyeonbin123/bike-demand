@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
+from datetime import date
 from pathlib import Path
 
 import duckdb
@@ -65,6 +66,20 @@ class Artifacts:
     # v2 수준 특징용. 없으면 빈 dict(해당 특징은 결측)
     halves: dict[tuple[str, int], float] = field(default_factory=dict)
     system_halves: dict[int, float] = field(default_factory=dict)
+    # 이 산출물을 만든 자료의 끝(history의 끝, 제외). 이 날까지 다 끝난 반기만 수준 특징에 쓴다
+    history_end: date | None = None
+
+    def half_is_complete(self, half: int) -> bool:
+        """반기 번호(frames.published_half와 같은 번호)의 기간이 자료 끝 전에 모두 끝났는가.
+
+        자료의 마지막 날 뒤에 걸친 반기는 일부(또는 0건인 하루)만 집계돼 있을 수 있다.
+        산출물을 갱신하지 않은 채 그 반기의 공개 시점을 넘기면 그 값을 최근 수준으로 읽게 되므로
+        막는다(T53).
+        """
+        if self.history_end is None:
+            return True
+        first_month_after = 6 * (half + 1)
+        return date(first_month_after // 12, first_month_after % 12 + 1, 1) <= self.history_end
 
 
 def load(directory: Path) -> Artifacts:
@@ -104,4 +119,5 @@ def load(directory: Path) -> Artifacts:
         trend=trend,
         global_trend=meta["global_trend"],
         max_station_code=max(int(r["station_code"]) for r in stations.values()),
+        history_end=date.fromisoformat(meta["history"][1]) if meta.get("history") else None,
     )

@@ -95,9 +95,17 @@ def feature_rows(
 
 
 def level_features(station_id: str, hour_start: datetime, artifacts: Artifacts) -> dict[str, float]:
-    """frames.LEVEL_SELECT와 같은 정의: 그 시각에 공개돼 있던 반기와 그 1년 전 반기."""
+    """frames.LEVEL_SELECT와 같은 정의: 그 시각에 공개돼 있던 반기와 그 1년 전 반기.
+
+    산출물의 자료가 그 반기를 다 담고 있지 않으면(산출물을 갱신하지 않고 반년 넘게 서비스한 경우)
+    0이나 일부 값 대신 결측으로 둔다.
+    """
     local = hour_start.astimezone(KST)
     half = published_half(local.year, local.month)
+    if not artifacts.half_is_complete(half):
+        return dict.fromkeys(
+            ("station_recent_mean", "station_recent_ratio", "system_recent_ratio"), math.nan
+        )
     mean = artifacts.halves.get((station_id, half))
     prior = artifacts.halves.get((station_id, half - 2))
     total = artifacts.system_halves.get(half)
