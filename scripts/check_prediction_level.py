@@ -3,13 +3,17 @@
 서비스 기간의 실제 대여 수는 반기마다 공개돼 아직 없다. 그래서 정확도가 아니라, 서비스 모델이 만든
 예측의 평균 수준이 지난 해 같은 시기(비 안 온 시간)와 얼마나 다른지만 본다. 읽기만 한다.
 
-- 예측: 서비스 DB `predictions`에서 주어진 버전 접두어의 행. 시각마다 가장 최근 발표로 만든 값 하나
+- 예측: 서비스 DB `predictions`에서 주어진 버전 접두어의 행 중 `--since`~`--until`(KST, 끝 포함)
+  시각, `--last-issue`까지의 발표로 만든 것. 시각마다 그중 가장 최근 발표의 값 하나.
+  기본값이 문서 결과를 만든 범위(2026-09-17 15:00 ~ 09-23 19:00, 09-21 20시 발표까지)라
+  그 뒤 쌓인 예측은 읽지 않는다
 - 실제: warehouse `int_station_hour_grid`(0건 포함)의 각 해 같은 달·일 구간 중
   강수 0, 공휴일 아닌 시간
 - 같은 대여소 x 쉬는 날 여부 x 시각끼리 평균을 맞추고, 예측 쪽 시간 수로 가중해 비교한다
 
 실행: uv run python scripts/check_prediction_level.py
-      (기본값 --version-prefix v3-M3p- --since 2026-09-17T15:00)
+      (기본값 --version-prefix v3-M3p- --since 2026-09-17T15:00 --until 2026-09-23T19:00
+       --last-issue 2026-09-21T20:00 → 407,847행·149시간)
 결과는 docs/experiments.md의 "서비스 예측 수준 진단"에 적었다.
 """
 
@@ -21,27 +25,40 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import duckdb
-from sqlalchemy import text
+from sqlalchemy import Engine, text
 
 from bike_demand.serving.db import make_engine
 
 KST = timezone(timedelta(hours=9))
 
 
-def predicted_cells(version_prefix: str, since: datetime) -> tuple[dict, dict, list[datetime]]:
-    """({(대여소, 쉬는 날, 시각): 평균 예측}, {같은 키: 시간 수}, 예측 시각 목록)."""
-    with make_engine().connect() as conn:
+def predicted_cells(
+    engine: Engine, version_prefix: str, since: datetime, until: datetime, last_issue: datetime
+) -> tuple[dict, dict, list[datetime]]:
+    """({(대여소, 쉬는 날, 시각): 평균 예측}, {같은 키: 시간 수}, 예측 시각 목록).
+
+    since~until(끝 포함)의 시각만, last_issue 이하의 발표(버전 이름 끝의 fcstYYYYMMDDHHMM)로 만든
+    행만 읽는다. 그래서 예측이 더 쌓여도 같은 범위를 다시 읽는다.
+    """
+    with engine.connect() as conn:
         rows = conn.execute(
             text(
                 """
                 select distinct on (station_id, hour_start)
                        station_id, hour_start, predicted_rentals
                 from predictions
-                where model_version like :prefix and hour_start >= :since
+                where model_version like :prefix
+                  and hour_start >= :since and hour_start <= :until
+                  and split_part(model_version, '-fcst', 2) <= :last_issue
                 order by station_id, hour_start, model_version desc
                 """
             ),
-            {"prefix": version_prefix + "%", "since": since},
+            {
+                "prefix": version_prefix + "%",
+                "since": since,
+                "until": until,
+                "last_issue": last_issue.astimezone(KST).strftime("%Y%m%d%H%M"),
+            },
         ).all()
     cells: dict[tuple[str, bool, int], list[float]] = defaultdict(list)
     for station_id, hour_start, value in rows:
@@ -77,7 +94,11 @@ def weighted_ratio(predicted: dict, weights: dict, actual: dict, keys: list) -> 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="서비스 예측 수준 진단(읽기 전용)")
     parser.add_argument("--version-prefix", default="v3-M3p-")
-    parser.add_argument("--since", default="2026-09-17T15:00", help="KST")
+    parser.add_argument("--since", default="2026-09-17T15:00", help="첫 예측 시각(KST)")
+    parser.add_argument("--until", default="2026-09-23T19:00", help="마지막 예측 시각(KST, 포함)")
+    parser.add_argument(
+        "--last-issue", default="2026-09-21T20:00", help="이 발표(KST)까지로 만든 예측만"
+    )
     parser.add_argument("--years", type=int, nargs="+", default=[2023, 2024, 2025])
     parser.add_argument("--start", default="09-15", help="비교할 구간 시작 MM-DD")
     parser.add_argument("--end", default="10-01", help="비교할 구간 끝 MM-DD (제외)")
@@ -85,7 +106,11 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     since = datetime.fromisoformat(args.since).replace(tzinfo=KST)
-    predicted, weights, hours = predicted_cells(args.version_prefix, since)
+    until = datetime.fromisoformat(args.until).replace(tzinfo=KST)
+    last_issue = datetime.fromisoformat(args.last_issue).replace(tzinfo=KST)
+    predicted, weights, hours = predicted_cells(
+        make_engine(), args.version_prefix, since, until, last_issue
+    )
     if not predicted:
         raise SystemExit("조건에 맞는 예측이 없음")
     first, last = hours[0].astimezone(KST), hours[-1].astimezone(KST)
