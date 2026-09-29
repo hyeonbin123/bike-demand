@@ -162,3 +162,42 @@ def test_stale_artifacts_give_missing_level_features_not_a_partial_half():
     )  # fmt: skip
     old_way = predict.level_features("ST-1", datetime(2027, 2, 1, 8, tzinfo=KST), legacy)
     assert old_way["station_recent_mean"] == 0.0
+
+
+def empty_artifacts():
+    return artifacts.Artifacts(
+        stations={}, district_codes={}, profile={}, trend={}, global_trend=None,
+        max_station_code=0,
+    )  # fmt: skip
+
+
+# 2026-09-25(금)은 추석, 09-29(화)는 평일
+CALENDAR_HOURS = [datetime(2026, 9, d, h, tzinfo=KST) for d in (25, 29) for h in (8, 18)]
+
+
+def test_feature_rows_computes_calendar_once_per_hour(monkeypatch):
+    """달력 특징은 시간에만 달려 있다. 대여소×시간마다 공휴일 달력을 다시 만들지 않는다."""
+    calls = []
+    original = predict.calendar_features
+
+    def counting(hour_start):
+        calls.append(hour_start)
+        return original(hour_start)
+
+    monkeypatch.setattr(predict, "calendar_features", counting)
+    weather = {h: dict.fromkeys(frames.WEATHER_FEATURES, 0.0) for h in CALENDAR_HOURS}
+    stations = [{"station_id": f"ST-{i}"} for i in range(3)]
+    matrix, keys = predict.feature_rows(stations, CALENDAR_HOURS, weather, empty_artifacts())
+    assert sorted(calls) == CALENDAR_HOURS
+    assert matrix.shape == (12, len(frames.FEATURES)) and len(keys) == 12
+
+
+def test_feature_rows_keep_holiday_calendar():
+    weather = {h: dict.fromkeys(frames.WEATHER_FEATURES, 0.0) for h in CALENDAR_HOURS}
+    stations = [{"station_id": f"ST-{i}"} for i in range(3)]
+    matrix, keys = predict.feature_rows(stations, CALENDAR_HOURS, weather, empty_artifacts())
+    column = {name: frames.FEATURES.index(name) for name in ("is_holiday", "is_offday")}
+    for row, (_, hour) in zip(matrix, keys, strict=True):
+        expected = 1.0 if hour.day == 25 else 0.0
+        assert row[column["is_holiday"]] == row[column["is_offday"]] == expected
+        assert row[column["is_holiday"]] == predict.calendar_features(hour)["is_holiday"]

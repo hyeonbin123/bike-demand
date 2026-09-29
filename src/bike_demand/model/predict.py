@@ -51,6 +51,8 @@ def feature_rows(
     """(특징 행렬, (station_id, hour_start) 목록). 열 순서는 features(기본 frames.FEATURES)."""
     features = features or FEATURES
     unseen = {}
+    # 달력 특징은 시간에만 달려 있다. 대여소마다 다시 계산하면 공휴일 달력을 대여소×시간 번 만든다
+    calendars = {hour_start: calendar_features(hour_start) for hour_start in hours}
     rows, keys = [], []
     for station in stations:
         station_id = station["station_id"]
@@ -75,7 +77,7 @@ def feature_rows(
             }
         trend = _num(artifacts.trend.get(station_id))
         for hour_start in hours:
-            calendar = calendar_features(hour_start)
+            calendar = calendars[hour_start]
             profile = artifacts.profile.get(
                 (station_id, bool(calendar["is_offday"]), int(calendar["hour_of_day"]))
             )
