@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import logging
 from datetime import date, datetime, timedelta, timezone
 from functools import lru_cache
 from pathlib import Path
@@ -21,6 +22,8 @@ from sqlalchemy.exc import OperationalError, SQLAlchemyError
 from bike_demand.api.shortage import expected_rentals
 from bike_demand.serving.db import make_engine
 from bike_demand.serving.models import Prediction, RealtimeSnapshot, Station
+
+logger = logging.getLogger(__name__)
 
 KST = timezone(timedelta(hours=9))
 DETAIL_HOURS = 6
@@ -110,9 +113,11 @@ app = FastAPI(title="bike-demand", version="0.1.0")
 
 
 @app.exception_handler(OperationalError)
-async def database_unavailable(_request, _exc) -> JSONResponse:
+async def database_unavailable(_request, exc: OperationalError) -> JSONResponse:
     # DB에 접속하지 못하면 어느 요청이든 /health와 같은 503 (docs/api.md).
-    # 쿼리 오류(ProgrammingError 등)는 장애로 가리지 않고 500으로 둔다
+    # 쿼리 오류(ProgrammingError 등)는 장애로 가리지 않고 500으로 둔다.
+    # 비밀번호·DB 이름 같은 설정 오류도 OperationalError로 오므로 원인은 로그에 남긴다
+    logger.error("database unavailable: %s", exc.orig or exc)
     return JSONResponse(status_code=503, content={"detail": "database unavailable"})
 
 

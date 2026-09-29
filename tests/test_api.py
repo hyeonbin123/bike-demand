@@ -218,3 +218,18 @@ def test_every_endpoint_503_json_when_database_is_down():
     finally:
         main.app.dependency_overrides.clear()
         broken.dispose()
+
+
+def test_database_unavailable_logs_the_cause(caplog):
+    """503은 원인을 숨기지만 로그에는 남긴다(비밀번호·DB 이름 오류도 OperationalError)."""
+    from sqlalchemy import create_engine
+
+    broken = create_engine("postgresql+psycopg://x:x@127.0.0.1:1/none?connect_timeout=1")
+    main.app.dependency_overrides[main.get_engine] = lambda: broken
+    try:
+        with caplog.at_level("ERROR", logger="bike_demand.api.main"):
+            assert TestClient(main.app).get("/stations").status_code == 503
+        assert any(r.getMessage().startswith("database unavailable: ") for r in caplog.records)
+    finally:
+        main.app.dependency_overrides.clear()
+        broken.dispose()
