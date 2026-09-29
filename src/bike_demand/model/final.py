@@ -6,9 +6,10 @@
    **한 번만** 잰다. 시작할 때 `<결과>.started` 예약 파일을 원자적으로 만들어 동시 실행과 중단 뒤
    다시 재는 것을 막는다(T27). 중단됐으면 사람이 사정을 확인한 뒤 예약 파일을 지운다.
    v2 결과는 test 기간을 두 번째로 본 것이라 그렇게 표시한다. v3는 계획대로 test를 재지 않는다.
-2. serving: 같은 후보를 전체 기간(2023-01~2026-06)으로 학습해 `serving/generations/<세대>/`에
-   모델·산출물·설명을 모두 쓴 뒤 `serving/CURRENT`(세대 이름 한 줄)를 원자적으로 바꾼다(T28).
-   예측 작업은 CURRENT를 한 번 읽고 그 세대의 파일만 쓴다.
+2. serving: 같은 후보를 전체 기간(2023-01~warehouse 격자의 마지막 달)으로 학습해
+   `serving/generations/<세대>/`에 모델·산출물·설명을 모두 쓴 뒤 `serving/CURRENT`(세대 이름
+   한 줄)를 원자적으로 바꾼다(T28). 예측 작업은 CURRENT를 한 번 읽고 그 세대의 파일만 쓴다.
+   기간 끝은 격자에서 정하므로 refresh_history로 새 반기를 넣은 뒤 다시 돌리면 그 반기까지 쓴다.
 
 실행: uv run python -m bike_demand.model.final test | serving
 """
@@ -19,7 +20,7 @@ import gc
 import json
 import os
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 import duckdb
@@ -41,7 +42,7 @@ from bike_demand.model.validate import fit_lightgbm, fit_lightgbm_separate_stop
 KST = timezone(timedelta(hours=9))
 RETRAIN = ("2023-01-01", "2025-07-01")
 TEST = ("2025-07-01", "2026-07-01")
-SERVING = ("2023-01-01", "2026-07-01")
+SERVING_START = "2023-01-01"
 CANDIDATE_FEATURES = {
     "M1": FEATURES,
     "M2": [f for f in FEATURES if f not in WEATHER_FEATURES],
@@ -147,13 +148,44 @@ def current_generation(serving_root: Path) -> tuple[str, Path]:
     raise FileNotFoundError(f"서비스 모델이 없음: {serving_root}")
 
 
-def fit_serving(warehouse: Path, out_dir: Path) -> dict:
+def serving_window(con: duckdb.DuckDBPyConnection) -> tuple[str, str]:
+    """(2023-01-01, 격자 마지막 달 다음 달 1일). 반기 갱신 뒤 다시 학습하면 새 자료까지 쓴다."""
+    last = con.execute("select max(hour_start) from int_station_hour_grid").fetchone()[0]
+    if last is None:
+        raise SystemExit("int_station_hour_grid가 비어 있음")
+    end = shift_months(f"{last:%Y-%m}-01", 1)
+    if last + timedelta(hours=1) != datetime.fromisoformat(end):
+        raise SystemExit(f"격자가 달 중간에서 끝남({last}). 끝난 달까지만 서비스 학습에 쓴다")
+    return (SERVING_START, end)
+
+
+def _checked_history_end(value: str, latest: str) -> str:
+    """--history-end는 격자 끝 이전의 달 첫날만 받는다(자료가 없는 달로 늘리지 않음)."""
+    try:
+        day = date.fromisoformat(value)
+    except ValueError:
+        day = None
+    if day is None or day.isoformat() != value or day.day != 1 or value > latest:
+        raise SystemExit(f"--history-end는 {latest} 이하의 YYYY-MM-01이어야 함: {value}")
+    return value
+
+
+def fit_serving(warehouse: Path, out_dir: Path, history_end: str | None = None) -> dict:
+    """history_end: 학습 기간 끝(제외). 기본은 warehouse 격자의 마지막 달 다음 달 1일."""
     selected, version = selected_model(out_dir)
     if selected not in CANDIDATE_FEATURES:
         raise SystemExit(f"기준선({selected})이 선택되어 서비스용 LightGBM 모델이 없음")
     levels = _uses_levels(selected)
     asof = version == "v3"
     features = CANDIDATE_FEATURES[selected]
+    # 기간을 먼저 정한다. 거부되면 빈 세대 폴더를 남기지 않는다
+    con = duckdb.connect(str(warehouse), read_only=True)
+    try:
+        history = serving_window(con)
+    finally:
+        con.close()
+    if history_end is not None:
+        history = (SERVING_START, _checked_history_end(history_end, history[1]))
     serving_root = out_dir / "serving"
     generation = generation_name(version, selected, datetime.now(KST))
     target = serving_root / "generations" / generation
@@ -168,30 +200,30 @@ def fit_serving(warehouse: Path, out_dir: Path) -> dict:
 
     con = duckdb.connect(str(warehouse), read_only=True)
     try:
-        meta = artifacts.export(con, SERVING, target / "artifacts", with_levels=levels)
+        meta = artifacts.export(con, history, target / "artifacts", with_levels=levels)
     finally:
         con.close()
     report: dict = {
         "selected": selected,
         "version": version,
         "generation": generation,
-        "history": SERVING,
+        "history": history,
         "artifacts": meta,
     }
-    stop_from = shift_months(SERVING[1], -2)
+    stop_from = shift_months(history[1], -2)
     log: dict = {}
     started = time.perf_counter()
     if asof:
         booster, _ = fit_lightgbm_separate_stop(
-            lambda: frame(Window(SERVING, (SERVING[0], stop_from))),
-            lambda: frame(Window(SERVING, SERVING)),
+            lambda: frame(Window(history, (history[0], stop_from))),
+            lambda: frame(Window(history, history)),
             features,
             log,
             stop_from,
         )
     else:
         booster, _ = fit_lightgbm(
-            frame(Window(SERVING, SERVING)), features, log, early_stop_from=stop_from, consume=True
+            frame(Window(history, history)), features, log, early_stop_from=stop_from, consume=True
         )
     report["seconds"] = round(time.perf_counter() - started, 1)
     report["training"] = log
@@ -217,8 +249,12 @@ if __name__ == "__main__":
     parser.add_argument("step", choices=["test", "serving"])
     parser.add_argument("--warehouse", type=Path, default=Path("data/warehouse/bike_demand.duckdb"))
     parser.add_argument("--out", type=Path, default=Path("data/models/v1"))
+    parser.add_argument(
+        "--history-end", help="serving 학습 기간 끝(제외) YYYY-MM-01, 기본은 격자 끝 다음 달"
+    )
     args = parser.parse_args()
     if args.step == "test":
         run_test(args.warehouse, args.out)
     else:
-        print(json.dumps(fit_serving(args.warehouse, args.out), ensure_ascii=False, default=str))
+        report = fit_serving(args.warehouse, args.out, args.history_end)
+        print(json.dumps(report, ensure_ascii=False, default=str))
