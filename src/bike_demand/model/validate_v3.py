@@ -40,6 +40,8 @@ def choose(results: dict[str, dict]) -> tuple[str, str]:
 
 
 def main(warehouse: Path, out_dir: Path) -> dict:
+    # 새 클론에는 data/models/v1이 없다. 몇 시간 학습한 뒤 모델을 쓰다 실패하지 않게 먼저 만든다
+    out_dir.mkdir(parents=True, exist_ok=True)
     report: dict = {
         "train": TRAIN,
         "validation": VALIDATION,
