@@ -47,6 +47,10 @@ unit_tests:
   - name: grid_stops_at_the_calendar_end
     description: "자료 마지막 날 밤 대여의 반납이 다음 날에 있어도 격자는 달력 끝에서 끝난다(T53)"
     model: int_station_hour_grid
+    # 입력·기대값이 2026-06-30 끝에 맞춰져 있다. refresh_history가 --vars로 넘기는 calendar_end와 상관없게 고정
+    overrides:
+      vars:
+        calendar_end: "2026-06-30"
     given:
       - input: ref('fct_station_hourly')
         rows:
