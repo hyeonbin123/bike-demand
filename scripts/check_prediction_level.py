@@ -6,7 +6,8 @@
 - 예측: 서비스 DB `predictions`에서 주어진 버전 접두어의 행 중 `--since`~`--until`(KST, 끝 포함)
   시각, `--last-issue`까지의 발표로 만든 것. 시각마다 그중 가장 최근 발표의 값 하나.
   기본값이 문서 결과를 만든 범위(2026-09-17 15:00 ~ 09-23 19:00, 09-21 20시 발표까지)라
-  그 뒤 쌓인 예측은 읽지 않는다
+  그 뒤 쌓인 예측은 읽지 않는다. 공휴일(KST 날짜) 시간은 실제 쪽처럼 뺀다. 예보에 비가 있던
+  시간은 거르지 않는다(기본 범위의 예보에는 비가 없었음)
 - 실제: warehouse `int_station_hour_grid`(0건 포함)의 각 해 같은 달·일 구간 중
   강수 0, 공휴일 아닌 시간
 - 같은 대여소 x 쉬는 날 여부 x 시각끼리 평균을 맞추고, 예측 쪽 시간 수로 가중해 비교한다
@@ -25,6 +26,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import duckdb
+import holidays
 from sqlalchemy import Engine, text
 
 from bike_demand.serving.db import make_engine
@@ -39,6 +41,8 @@ def predicted_cells(
 
     since~until(끝 포함)의 시각만, last_issue 이하의 발표(버전 이름 끝의 fcstYYYYMMDDHHMM)로 만든
     행만 읽는다. 그래서 예측이 더 쌓여도 같은 범위를 다시 읽는다.
+    KST 날짜가 공휴일인 시간은 뺀다(실제 쪽 `not is_holiday`와 같은 규칙). 남은 시간의 쉬는 날
+    여부는 주말이므로 실제 쪽 is_offday와 같다.
     """
     with engine.connect() as conn:
         rows = conn.execute(
@@ -60,13 +64,18 @@ def predicted_cells(
                 "last_issue": last_issue.astimezone(KST).strftime("%Y%m%d%H%M"),
             },
         ).all()
+    # dbt 공휴일 시드(holidays_seed.py)와 같은 달력. 행마다 만들지 않고 한 번만 만든다
+    kr = holidays.country_holidays(
+        "KR", years=range(since.astimezone(KST).year, until.astimezone(KST).year + 1)
+    )
+    kept = [row for row in rows if row[1].astimezone(KST).date() not in kr]
     cells: dict[tuple[str, bool, int], list[float]] = defaultdict(list)
-    for station_id, hour_start, value in rows:
+    for station_id, hour_start, value in kept:
         local = hour_start.astimezone(KST)
         cells[(station_id, local.isoweekday() >= 6, local.hour)].append(value)
     means = {key: sum(values) / len(values) for key, values in cells.items()}
     weights = {key: len(values) for key, values in cells.items()}
-    return means, weights, sorted({row[1] for row in rows})
+    return means, weights, sorted({row[1] for row in kept})
 
 
 def actual_cells(con: duckdb.DuckDBPyConnection, year: int, start: str, end: str) -> dict:
