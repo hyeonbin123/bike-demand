@@ -7,8 +7,8 @@
 with hours as (
 
     select unnest(generate_series(
-        timestamp '{{ var("calendar_start", "2023-01-01") }}',
-        timestamp '{{ var("calendar_end", "2026-06-30") }}' + interval 23 hour,
+        timestamp '{{ var("calendar_start") }}',
+        timestamp '{{ var("calendar_end") }}' + interval 23 hour,
         interval 1 hour
     )) as hour_start
 

@@ -10,6 +10,10 @@ macro-paths: ["macros"]
 
 vars:
   data_dir: "data"
+  # 달력(dim_hours)과 격자의 기간. refresh_history는 원본 최신 달 말일을 --vars calendar_end로 넘긴다(T32).
+  # 새 반기를 넣고 손으로 빌드할 때도 넘겨야 한다. 빠뜨리면 assert_calendar_covers_rentals가 실패한다
+  calendar_start: "2023-01-01"
+  calendar_end: "2026-06-30"
 
 models:
   bike_demand:

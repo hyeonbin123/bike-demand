@@ -117,3 +117,15 @@ def test_dag_build_with_a_later_calendar_end_passes(new_half_year, tmp_path):
         ).fetchone()
     assert last_hour == datetime(2026, 12, 31, 23)
     assert december == (1,)
+
+
+def test_build_without_the_new_calendar_end_fails_instead_of_dropping_the_half_year(
+    new_half_year, tmp_path
+):
+    """새 반기를 넣고 calendar_end 없이(기본 2026-06-30) 빌드하면 조용히 잘리지 않고 실패한다.
+
+    달력과 격자가 같은 경계로 함께 잘려 assert_grid_within_calendar로는 잡히지 않는다.
+    """
+    proc, status = dbt_build(new_half_year, tmp_path)
+    assert proc.returncode != 0, proc.stdout[-3000:]
+    assert _not_ok(status) == {"assert_calendar_covers_rentals": "fail"}

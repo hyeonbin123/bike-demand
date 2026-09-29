@@ -80,6 +80,8 @@ uv run python -m bike_demand.ingest.stations    # data/raw/stations → data/bro
 PYTHONUTF8=1 uv run dbt build --project-dir dbt --profiles-dir dbt
 ```
 
+달력(`dim_hours`)과 격자는 기본으로 2026-06-30에서 끝난다. 새 반기는 `refresh_history` DAG로 넣는다. 손으로 빌드할 때는 원본 최신 달의 말일(`uv run python -m bike_demand.pipelines latest-trip-month --last-day`)을 `--vars "{calendar_end: 'YYYY-MM-DD'}"`로 넘기고, 날씨도 `ingest.weather --end YYYY-MM`으로 같은 달까지 받는다. 넘기지 않으면 달력 밖 대여를 잡는 검사(`assert_calendar_covers_rentals`)에서 빌드가 실패한다.
+
 날씨 수집은 `.env.example`을 `.env`로 복사해 공공데이터포털 인증키를 넣은 뒤 `uv run python -m bike_demand.ingest.weather`. 실시간 대여정보는 서울 열린데이터광장 인증키가 필요하다.
 
 테스트: `uv run pytest`, `uv run ruff check .` (DB 테스트는 `docker compose up -d db`가 떠 있어야 하고, 없으면 건너뜀). 새로 클론한 저장소에서 `uv sync` → `ruff check`·`pytest`(207개)·`dbt parse`·`docker compose config`·`alembic history`가 원본 데이터 없이 통과하는 것을 확인했다(2026-09-17).

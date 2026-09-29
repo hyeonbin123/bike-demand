@@ -22,7 +22,7 @@ active as (
     from hourly as h
     inner join {{ ref('dim_stations') }} as d using (station_id)
     where d.total_rentals > 0
-        and h.hour_start < timestamp '{{ var("calendar_end", "2026-06-30") }}' + interval 1 day
+        and h.hour_start < timestamp '{{ var("calendar_end") }}' + interval 1 day
     group by 1
 
 ),
