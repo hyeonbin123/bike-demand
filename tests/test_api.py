@@ -192,3 +192,29 @@ def test_health_503_when_database_is_down(client):
     main.app.dependency_overrides[main.get_engine] = lambda: broken
     response = client.get("/health")
     assert response.status_code == 503 and response.json() == {"detail": "database unavailable"}
+
+
+def test_every_endpoint_503_json_when_database_is_down():
+    """DB에 접속하지 못하면 /health(위 테스트)만이 아니라 모든 요청이 503 JSON(docs/api.md 공통).
+
+    pg_engine을 쓰지 않아 DB 없이도 돈다.
+    """
+    from sqlalchemy import create_engine
+
+    broken = create_engine("postgresql+psycopg://x:x@127.0.0.1:1/none?connect_timeout=1")
+    main.app.dependency_overrides[main.get_engine] = lambda: broken
+    main.app.dependency_overrides[main.get_now] = lambda: NOW
+    try:
+        client = TestClient(main.app)
+        for path in [
+            "/stations",
+            "/stations/ST-1",
+            "/shortage-risk",
+            "/predictions/ST-1?date=2026-09-17",
+        ]:
+            response = client.get(path)
+            assert response.status_code == 503, path
+            assert response.json() == {"detail": "database unavailable"}, path
+    finally:
+        main.app.dependency_overrides.clear()
+        broken.dispose()

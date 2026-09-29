@@ -12,11 +12,11 @@ from pathlib import Path
 from typing import Annotated
 
 from fastapi import Depends, FastAPI, HTTPException, Query
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from sqlalchemy import Engine, and_, func, select, text
-from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.exc import OperationalError, SQLAlchemyError
 
 from bike_demand.api.shortage import expected_rentals
 from bike_demand.serving.db import make_engine
@@ -107,6 +107,15 @@ class Health(BaseModel):
 
 
 app = FastAPI(title="bike-demand", version="0.1.0")
+
+
+@app.exception_handler(OperationalError)
+async def database_unavailable(_request, _exc) -> JSONResponse:
+    # DB에 접속하지 못하면 어느 요청이든 /health와 같은 503 (docs/api.md).
+    # 쿼리 오류(ProgrammingError 등)는 장애로 가리지 않고 500으로 둔다
+    return JSONResponse(status_code=503, content={"detail": "database unavailable"})
+
+
 STATIC_DIR = Path(__file__).with_name("static")
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
