@@ -11,7 +11,7 @@ import traceback
 from contextlib import contextmanager
 from datetime import date
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import conftest
 import httpx
@@ -244,3 +244,42 @@ def test_t30_temporary_database_dropped_when_upgrade_or_engine_fails(failure):
     assert statements[1].startswith('drop database if exists "bike_demand_test_')
     assert statements[0].split('"')[1] == statements[1].split('"')[1]
     assert disposed == [True]
+
+
+def _unreachable_admin():
+    """접속하면 서버에 닿지 못했다는 오류를 내는 관리 엔진."""
+    from sqlalchemy.exc import OperationalError
+
+    admin = Mock()
+    admin.connect.side_effect = OperationalError("connect", {}, Exception("timeout expired"))
+    return admin
+
+
+def test_temporary_database_admin_engine_gives_up_connecting_quickly():
+    """DB가 꺼져 있으면 Windows의 psycopg는 거부된 연결을 알아채지 못해 멈춘다. 관리 엔진도 서비스
+    엔진처럼 접속 제한 시간이 있어야 DB 테스트가 멈추지 않고 건너뛴다(2026-09-29 검토)."""
+    admin = _unreachable_admin()
+    with patch.object(conftest, "create_engine", return_value=admin) as create:
+        with pytest.raises(conftest.DatabaseUnavailable, match="OperationalError"):
+            with conftest.temporary_database():
+                raise AssertionError("unreachable")
+    connect_args = create.call_args.kwargs.get("connect_args", {})
+    assert 0 < connect_args.get("connect_timeout", 0) <= 10
+    admin.dispose.assert_called_once()
+
+
+def test_pg_engine_remembers_an_unreachable_server(monkeypatch, request):
+    monkeypatch.setattr(conftest, "_db_unavailable", None, raising=False)
+    with patch.object(conftest, "create_engine", return_value=_unreachable_admin()):
+        with pytest.raises(pytest.skip.Exception, match="OperationalError"):
+            request.getfixturevalue("pg_engine")
+    assert conftest._db_unavailable == "OperationalError"
+
+
+def test_pg_engine_skips_without_connecting_after_an_unreachable_server(monkeypatch, request):
+    """한 번 접속에 실패하면 나머지 DB 테스트는 제한 시간을 다시 기다리지 않고 바로 건너뛴다."""
+    monkeypatch.setattr(conftest, "_db_unavailable", "OperationalError", raising=False)
+    with patch.object(conftest, "create_engine", return_value=_unreachable_admin()) as create:
+        with pytest.raises(pytest.skip.Exception, match="OperationalError"):
+            request.getfixturevalue("pg_engine")
+    create.assert_not_called()

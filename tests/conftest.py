@@ -31,7 +31,13 @@ def temporary_database(upgrade=None):
     from alembic.config import Config
 
     base = make_url(database_url())
-    admin = create_engine(base.set(database="postgres"), isolation_level="AUTOCOMMIT")
+    admin = create_engine(
+        base.set(database="postgres"),
+        isolation_level="AUTOCOMMIT",
+        # DB가 꺼져 있으면 Windows의 psycopg가 거부된 연결을 알아채지 못하고 멈춘다.
+        # make_engine과 같은 5초 제한을 둔다
+        connect_args={"connect_timeout": 5},
+    )
     name = f"bike_demand_test_{uuid.uuid4().hex[:12]}"
     try:
         with admin.connect() as conn:
@@ -56,12 +62,20 @@ def temporary_database(upgrade=None):
         admin.dispose()
 
 
+# 한 번 접속에 실패하면 이번 실행의 나머지 DB 테스트는 제한 시간을 다시 기다리지 않고 바로 건너뛴다
+_db_unavailable: str | None = None
+
+
 @pytest.fixture
 def pg_engine():
+    global _db_unavailable
+    if _db_unavailable is not None:
+        pytest.skip(f"PostgreSQL에 접속할 수 없음 (docker compose up -d db): {_db_unavailable}")
     try:
         with temporary_database() as engine:
             yield engine
     except DatabaseUnavailable as exc:
+        _db_unavailable = str(exc)
         pytest.skip(f"PostgreSQL에 접속할 수 없음 (docker compose up -d db): {exc}")
 
 
