@@ -17,7 +17,8 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from sqlalchemy import Engine, and_, func, select, text
-from sqlalchemy.exc import OperationalError, SQLAlchemyError
+from sqlalchemy.exc import OperationalError
+from sqlalchemy.exc import TimeoutError as PoolTimeout
 
 from bike_demand.api.shortage import expected_rentals
 from bike_demand.serving.db import make_engine
@@ -113,11 +114,12 @@ app = FastAPI(title="bike-demand", version="0.1.0")
 
 
 @app.exception_handler(OperationalError)
-async def database_unavailable(_request, exc: OperationalError) -> JSONResponse:
-    # DB에 접속하지 못하면 어느 요청이든 /health와 같은 503 (docs/api.md).
-    # 쿼리 오류(ProgrammingError 등)는 장애로 가리지 않고 500으로 둔다.
+@app.exception_handler(PoolTimeout)
+async def database_unavailable(_request, exc: OperationalError | PoolTimeout) -> JSONResponse:
+    # DB에 접속하지 못하면(연결 실패, 연결 풀 대기 시간 초과) /health를 포함한 모든 요청이 503
+    # (docs/api.md). 쿼리 오류(ProgrammingError 등)는 장애로 가리지 않고 500으로 둔다.
     # 비밀번호·DB 이름 같은 설정 오류도 OperationalError로 오므로 원인은 로그에 남긴다
-    logger.error("database unavailable: %s", exc.orig or exc)
+    logger.error("database unavailable: %s", getattr(exc, "orig", None) or exc)
     return JSONResponse(status_code=503, content={"detail": "database unavailable"})
 
 
@@ -157,20 +159,16 @@ def latest_version(conn, where=None) -> str | None:
 
 @app.get("/health", response_model=Health)
 def health(engine: EngineDep) -> Health:
-    try:
-        with engine.connect() as conn:
-            conn.execute(text("select 1"))
-            snapshot = conn.execute(select(func.max(RealtimeSnapshot.fetched_at))).scalar_one()
-            version = latest_version(conn)
-            last_hour = None
-            if version is not None:
-                last_hour = conn.execute(
-                    select(func.max(Prediction.hour_start)).where(
-                        Prediction.model_version == version
-                    )
-                ).scalar_one()
-    except SQLAlchemyError:
-        raise HTTPException(503, "database unavailable") from None
+    # DB 접속 실패는 다른 경로처럼 공통 처리기(database_unavailable)가 503으로 답하고 로그를 남긴다
+    with engine.connect() as conn:
+        conn.execute(text("select 1"))
+        snapshot = conn.execute(select(func.max(RealtimeSnapshot.fetched_at))).scalar_one()
+        version = latest_version(conn)
+        last_hour = None
+        if version is not None:
+            last_hour = conn.execute(
+                select(func.max(Prediction.hour_start)).where(Prediction.model_version == version)
+            ).scalar_one()
     return Health(
         status="ok",
         database="ok",

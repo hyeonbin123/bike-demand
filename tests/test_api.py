@@ -233,3 +233,82 @@ def test_database_unavailable_logs_the_cause(caplog):
     finally:
         main.app.dependency_overrides.clear()
         broken.dispose()
+
+
+def test_health_logs_the_cause_like_every_endpoint(caplog):
+    """/health도 공통 처리기로 503을 답하고 원인을 로그에 남긴다(T58). DB 없이 돈다."""
+    from sqlalchemy import create_engine
+
+    broken = create_engine("postgresql+psycopg://x:x@127.0.0.1:1/none?connect_timeout=1")
+    main.app.dependency_overrides[main.get_engine] = lambda: broken
+    try:
+        with caplog.at_level("ERROR", logger="bike_demand.api.main"):
+            response = TestClient(main.app).get("/health")
+        assert response.status_code == 503
+        assert response.json() == {"detail": "database unavailable"}
+        assert any(r.getMessage().startswith("database unavailable: ") for r in caplog.records)
+    finally:
+        main.app.dependency_overrides.clear()
+        broken.dispose()
+
+
+class QueryBugEngine:
+    """접속은 되지만 쿼리가 틀린 DB(예: 마이그레이션 전이라 표가 없음)."""
+
+    def connect(self):
+        return self
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def execute(self, *args, **kwargs):
+        from sqlalchemy.exc import ProgrammingError
+
+        raise ProgrammingError("select 1", {}, Exception("relation does not exist"))
+
+
+ALL_PATHS = [
+    "/health",
+    "/stations",
+    "/stations/ST-1",
+    "/shortage-risk",
+    "/predictions/ST-1?date=2026-09-17",
+]
+
+
+def test_query_errors_stay_500_on_every_endpoint():
+    """쿼리 오류는 DB 장애로 가리지 않는다: /health를 포함해 모든 요청이 500(T58)."""
+    main.app.dependency_overrides[main.get_engine] = lambda: QueryBugEngine()
+    main.app.dependency_overrides[main.get_now] = lambda: NOW
+    try:
+        client = TestClient(main.app, raise_server_exceptions=False)
+        for path in ALL_PATHS:
+            assert client.get(path).status_code == 500, path
+    finally:
+        main.app.dependency_overrides.clear()
+
+
+def test_pool_timeout_is_503_on_every_endpoint():
+    """연결 풀이 다 차서 기다린 시간이 넘으면 DB에 접속하지 못한 것과 같은 503(T58)."""
+    from sqlalchemy import create_engine
+    from sqlalchemy.pool import QueuePool
+
+    busy = create_engine(
+        "sqlite://", poolclass=QueuePool, pool_size=1, max_overflow=0, pool_timeout=0.1
+    )
+    held = busy.connect()  # 하나뿐인 연결을 잡아 둔다
+    main.app.dependency_overrides[main.get_engine] = lambda: busy
+    main.app.dependency_overrides[main.get_now] = lambda: NOW
+    try:
+        client = TestClient(main.app, raise_server_exceptions=False)
+        for path in ALL_PATHS:
+            response = client.get(path)
+            assert response.status_code == 503, path
+            assert response.json() == {"detail": "database unavailable"}, path
+    finally:
+        main.app.dependency_overrides.clear()
+        held.close()
+        busy.dispose()
