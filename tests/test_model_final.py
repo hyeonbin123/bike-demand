@@ -190,3 +190,19 @@ def test_serving_history_end_can_only_shorten_to_a_month_start(tmp_path, fake_tr
     report = final.fit_serving(warehouse, out, "2026-07-01")
     assert list(report["history"]) == ["2023-01-01", "2026-07-01"]
     assert fake_training == {"stop_from": "2026-05-01", "rows": 30648}
+
+
+def test_serving_history_end_leaves_training_months_before_early_stopping(tmp_path, fake_training):
+    """끝 2개월은 조기 종료에 쓰므로 그 앞에 학습할 달이 남는 값만 받는다(T59).
+
+    2023-03-01 이하는 학습 구간이 비어 세대 폴더를 만든 뒤 LightGBM이 num_data > 0으로 실패했다.
+    """
+    warehouse = serving_warehouse(tmp_path / "wh.duckdb", "2023-12-31 23:00:00")
+    for bad in ("2023-03-01", "2023-01-01", "2022-01-01", "0001-01-01"):
+        with pytest.raises(SystemExit, match="history-end"):
+            final.fit_serving(warehouse, selected_v3(tmp_path / f"refused-{bad}"), bad)
+        assert not (tmp_path / f"refused-{bad}" / "serving").exists()
+    assert fake_training == {}
+    report = final.fit_serving(warehouse, selected_v3(tmp_path / "models"), "2023-04-01")
+    assert list(report["history"]) == ["2023-01-01", "2023-04-01"]
+    assert fake_training == {"stop_from": "2023-02-01", "rows": 2160}  # 2023-01~03 시간 수

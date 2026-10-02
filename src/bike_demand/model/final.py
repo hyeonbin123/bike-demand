@@ -160,13 +160,19 @@ def serving_window(con: duckdb.DuckDBPyConnection) -> tuple[str, str]:
 
 
 def _checked_history_end(value: str, latest: str) -> str:
-    """--history-end는 격자 끝 이전의 달 첫날만 받는다(자료가 없는 달로 늘리지 않음)."""
+    """--history-end는 격자 끝 이전의 달 첫날만 받는다(자료가 없는 달로 늘리지 않음).
+
+    끝 2개월은 조기 종료에 쓰므로 그 앞에 학습할 달이 한 달 이상 남아야 한다.
+    """
+    earliest = shift_months(SERVING_START, 3)
     try:
         day = date.fromisoformat(value)
     except ValueError:
         day = None
-    if day is None or day.isoformat() != value or day.day != 1 or value > latest:
-        raise SystemExit(f"--history-end는 {latest} 이하의 YYYY-MM-01이어야 함: {value}")
+    if day is None or day.isoformat() != value or day.day != 1 or not earliest <= value <= latest:
+        raise SystemExit(
+            f"--history-end는 {earliest} 이상 {latest} 이하의 YYYY-MM-01이어야 함: {value}"
+        )
     return value
 
 
