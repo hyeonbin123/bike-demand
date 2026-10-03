@@ -1,3 +1,5 @@
 * text=auto eol=lf
 *.parquet binary
 *.duckdb binary
+# v5 고정 파일 사본: 기록한 SHA-256과 바이트가 같아야 한다(LightGBM 파일에 CRLF 두 줄이 있음)
+docs/v5/* -text
