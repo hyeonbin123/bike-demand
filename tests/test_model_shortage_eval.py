@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import hashlib
 import itertools
 import json
 import math
+import shutil
 from datetime import datetime, timedelta
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -470,6 +473,93 @@ def test_test_run_refuses_before_the_earliest_time_and_runs_only_once(tmp_path):
     (tmp_path / "test.json").write_text("{}", encoding="utf-8")
     with pytest.raises(SystemExit, match="한 번만"):
         se.run_test(None, None, tmp_path, se.TEST_END + timedelta(days=3))
+
+
+FROZEN = Path(__file__).resolve().parents[1] / "docs" / "v5"
+
+
+def _sha(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def frozen_out(tmp_path: Path) -> Path:
+    """test 실행 폴더에 고정 파일 사본을 둔다."""
+    for name in ("dev_fit.json", "dev_lgbm.txt"):
+        shutil.copyfile(FROZEN / name, tmp_path / name)
+    return tmp_path
+
+
+class PastHashCheck(Exception):
+    pass
+
+
+def test_frozen_dev_files_in_the_repo_match_the_recorded_hashes():
+    # docs/experiments.md 'v5 개발 자료로 고정한 값'(8fb59c8)에 적은 SHA-256
+    assert (
+        se.FROZEN_FIT_SHA256 == "528be96c7e0d10fb674a79f11e25a325d3aef78eb80b2e6a7ee4de97ccdc7f6e"
+    )
+    assert (
+        se.FROZEN_LGBM_SHA256 == "87b25afb0953826f362f799d60681fccd9a85a4e8aa164ba6906aafb4756de38"
+    )
+    assert _sha(FROZEN / "dev_fit.json") == se.FROZEN_FIT_SHA256
+    assert _sha(FROZEN / "dev_lgbm.txt") == se.FROZEN_LGBM_SHA256
+    fit = json.loads((FROZEN / "dev_fit.json").read_text("utf-8"))
+    assert fit["lgbm"]["sha256"] == se.FROZEN_LGBM_SHA256
+    assert (fit["phi"], fit["challenger"], fit["logistic"]["C"]) == (2.0, "S4", 1.0)
+    assert len(fit["logistic"]["mean"]) == len(fit["logistic"]["std"]) == 18
+
+
+def test_dev_run_refuses_to_overwrite_the_frozen_values(tmp_path):
+    for name in ("dev_fit.json", "dev_lgbm.txt"):
+        out = tmp_path / name.split(".")[0]
+        out.mkdir()
+        (out / name).write_text("{}", encoding="utf-8")
+        with pytest.raises(SystemExit, match="덮어쓰지"):
+            se.run_dev(None, None, None, out)
+        assert (out / name).read_text("utf-8") == "{}"
+
+
+def test_test_run_refuses_fit_files_other_than_the_frozen_ones(tmp_path, monkeypatch):
+    def past(*args, **kwargs):
+        raise PastHashCheck
+
+    monkeypatch.setattr(se, "load_profile", past)
+    after = se.TEST_END + timedelta(days=8)
+    with pytest.raises(SystemExit, match="고정한 파일"):
+        se.run_test(None, None, tmp_path, after)  # 파일 없음
+    # dev를 다시 돌려 자기 안에서는 맞는 새 파일이 생긴 경우
+    lgbm = tmp_path / "dev_lgbm.txt"
+    lgbm.write_text("tree\n", encoding="utf-8")
+    fit = {"generation": "g", "phi": 2.0, "challenger": "S4", "lgbm": {"file": lgbm.name}}
+    fit["lgbm"]["sha256"] = _sha(lgbm)
+    (tmp_path / "dev_fit.json").write_text(json.dumps(fit), encoding="utf-8")
+    with pytest.raises(SystemExit, match="고정한 파일"):
+        se.run_test(None, None, tmp_path, after)
+    # 고정 fit에 다른 LightGBM 파일
+    shutil.copyfile(FROZEN / "dev_fit.json", tmp_path / "dev_fit.json")
+    with pytest.raises(SystemExit, match="고정한 파일"):
+        se.run_test(None, None, tmp_path, after)
+    with pytest.raises(PastHashCheck):
+        se.run_test(None, None, frozen_out(tmp_path), after)
+    assert not (tmp_path / "test.started").exists()
+
+
+def test_test_run_stops_before_the_start_mark_when_no_issue_is_valid(tmp_path, monkeypatch):
+    base = se.TEST_START + timedelta(hours=2)
+    key = se.issue_key(base)
+    monkeypatch.setattr(se, "load_profile", lambda warehouse: PROFILE)
+    monkeypatch.setattr(
+        se, "load_snapshots", lambda *a: snapshots({"A": [3] * 60}, base - timedelta(hours=1))
+    )
+    # 2027년 초 서비스 재학습 뒤처럼 저장 예측이 다른 세대
+    monkeypatch.setattr(se, "stored_versions", lambda *a: {key: f"v9-new-fcst{key}"})
+    monkeypatch.setattr(se, "issue_bases", lambda *a: [base])
+    monkeypatch.setattr(se, "load_forecast", lambda *a: {})
+    out = frozen_out(tmp_path)
+    with pytest.raises(SystemExit, match="유효한 발표가 없음.*다른 세대 1개"):
+        se.run_test(None, None, out, se.TEST_MAX_END + timedelta(days=1))
+    assert not (out / "test.started").exists()
+    assert not (out / "test.json").exists()
 
 
 def test_plan_constants_match_the_registered_rules():

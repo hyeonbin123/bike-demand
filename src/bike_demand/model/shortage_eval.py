@@ -54,6 +54,12 @@ TEST_MAX_END = datetime(2026, 10, 25, tzinfo=KST)
 EVAL_DELAY = timedelta(hours=6)  # 마지막 발표(23:15)의 6시간 창이 끝난 뒤
 MIN_VALID_DAYS = 10
 
+# test 전에 개발 6일로 고정하고 해시를 기록한 파일(`8fb59c8`). 저장소 사본은 FROZEN_COPY.
+# test는 이 두 파일로만 돌고, dev는 이미 있는 파일을 덮어쓰지 않는다
+FROZEN_FIT_SHA256 = "528be96c7e0d10fb674a79f11e25a325d3aef78eb80b2e6a7ee4de97ccdc7f6e"
+FROZEN_LGBM_SHA256 = "87b25afb0953826f362f799d60681fccd9a85a4e8aa164ba6906aafb4756de38"
+FROZEN_COPY = "docs/v5"
+
 
 # ---------------------------------------------------------------- 스냅샷과 정답
 
@@ -1031,13 +1037,22 @@ def _write_json(path, data) -> None:
 
 
 def run_dev(engine, warehouse, models_dir, out_dir, n_boot: int = BOOT_N) -> dict:
-    """개발 6일: 행을 만들고 φ·도전자·분류기를 정해 out_dir에 고정한다(test 전에 커밋할 값)."""
+    """개발 6일: 행을 만들고 φ·도전자·분류기를 정해 out_dir에 고정한다(test 전에 커밋할 값).
+
+    out_dir에 고정 파일이 이미 있으면 SystemExit(다시 재 보는 실행은 다른 폴더에).
+    """
     import json
 
     from bike_demand.model import shortage_nowcast as nc
     from bike_demand.model.final import load_serving_model
     from bike_demand.serving.models import Station
 
+    for name in ("dev_fit.json", "dev_lgbm.txt"):
+        if (out_dir / name).exists():
+            raise SystemExit(
+                f"{out_dir / name}가 이미 있음: test 전에 고정한 값은 덮어쓰지 않는다. "
+                "다시 재 보려면 --out에 다른 폴더를 준다"
+            )
     start, end = DEV_WINDOW
     generation, booster, artifacts = load_serving_model(models_dir)
     features = booster.feature_name()
@@ -1169,7 +1184,11 @@ def run_dev(engine, warehouse, models_dir, out_dir, n_boot: int = BOOT_N) -> dic
 
 
 def run_test(engine, warehouse, out_dir, now: datetime, n_boot: int = BOOT_N) -> dict:
-    """14일 test를 한 번 잰다. 평가 가능 시각 전이나 이미 잰 뒤에는 SystemExit."""
+    """14일 test를 한 번 잰다.
+
+    평가 가능 시각 전, 이미 잰 뒤, out_dir의 dev_fit.json·dev_lgbm.txt가 고정 해시와 다를 때,
+    test 창에 유효한 발표가 없을 때(시작 표시를 쓰기 전)는 SystemExit.
+    """
     import json
 
     from bike_demand.model import shortage_nowcast as nc
@@ -1181,10 +1200,14 @@ def run_test(engine, warehouse, out_dir, now: datetime, n_boot: int = BOOT_N) ->
     if now < TEST_END + EVAL_DELAY:
         raise SystemExit(f"test 평가는 {(TEST_END + EVAL_DELAY).isoformat()} 이후")
     fit_path = out_dir / "dev_fit.json"
+    lgbm_path = out_dir / "dev_lgbm.txt"
+    for path, expected in ((fit_path, FROZEN_FIT_SHA256), (lgbm_path, FROZEN_LGBM_SHA256)):
+        if not path.is_file() or _sha256(path) != expected:
+            raise SystemExit(
+                f"{path}가 고정한 파일(SHA-256 {expected[:12]}…)이 아님: "
+                f"{FROZEN_COPY}/{path.name}을 복사해 쓴다"
+            )
     fit = json.loads(fit_path.read_text("utf-8"))
-    lgbm_path = out_dir / fit["lgbm"]["file"]
-    if _sha256(lgbm_path) != fit["lgbm"]["sha256"]:
-        raise SystemExit("고정한 LightGBM 파일이 바뀜")
 
     profile = load_profile(warehouse)
     snaps = load_snapshots(engine, TEST_START - 2 * HOUR, TEST_MAX_END + (HOUR_COLUMNS + 1) * HOUR)
@@ -1206,6 +1229,12 @@ def run_test(engine, warehouse, out_dir, now: datetime, n_boot: int = BOOT_N) ->
             yield IssueInput(base, predictions, rain, version)
 
     rows, log = build_rows(snaps, inputs(), profile)
+    if valid_days(log, TEST_MAX_END) == 0:
+        # 수집이 없었거나 서비스 모델 세대가 바뀐 경우. 한 번뿐인 시작 표시를 쓰지 않는다
+        raise SystemExit(
+            f"test 창에 유효한 발표가 없음(다른 세대 {len(skipped_generation)}개, "
+            f"고정값 세대 {fit['generation']}). 시작 표시를 남기지 않고 멈춘다"
+        )
     end = TEST_END
     while True:
         if now < end + EVAL_DELAY:
