@@ -93,6 +93,7 @@ version = "0.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "alembic" },
+    { name = "dbt-core" },
     { name = "dbt-duckdb" },
     { name = "duckdb" },
     { name = "fastapi" },
@@ -120,8 +121,9 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "alembic", specifier = ">=1.20.0" },
+    { name = "dbt-core", specifier = "<2" },
     { name = "dbt-duckdb", specifier = ">=1.11.0" },
-    { name = "duckdb", specifier = ">=1.5.5" },
+    { name = "duckdb", specifier = ">=1.5.5,<2" },
     { name = "fastapi", specifier = ">=0.141.1" },
     { name = "holidays", specifier = ">=0.104" },
     { name = "httpx", specifier = ">=0.28.1" },
@@ -132,7 +134,7 @@ requires-dist = [
     { name = "pyarrow", specifier = ">=25.0.1" },
     { name = "python-dotenv", specifier = ">=1.2.3" },
     { name = "scipy", specifier = ">=1.17" },
-    { name = "sqlalchemy", specifier = ">=2.0" },
+    { name = "sqlalchemy", specifier = ">=2.0,<2.1" },
     { name = "uvicorn", extras = ["standard"], specifier = ">=0.53.0" },
 ]
 

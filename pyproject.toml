@@ -2,10 +2,15 @@
 name = "bike-demand"
 version = "0.1.0"
 requires-python = ">=3.11"
+# 상한(2026-10-04): DuckDB 2.0(새 기본 저장 형식), SQLAlchemy 2.1, dbt-core 2.0이 열린 하한으로
+# 다음 `uv lock --upgrade`에 들어오지 않게 막는다. 올리는 일은 warehouse를 다시 만드는 2027년 초
+# refresh_history 때 구·신 DuckDB 결과 해시 비교와 함께 한다. dbt-core는 dbt-duckdb가 끌어오며
+# 여기에는 상한만 둔다.
 dependencies = [
     "alembic>=1.20.0",
+    "dbt-core<2",
     "dbt-duckdb>=1.11.0",
-    "duckdb>=1.5.5",
+    "duckdb>=1.5.5,<2",
     "fastapi>=0.141.1",
     "holidays>=0.104",
     "httpx>=0.28.1",
@@ -16,7 +21,7 @@ dependencies = [
     "pyarrow>=25.0.1",
     "python-dotenv>=1.2.3",
     "scipy>=1.17",
-    "sqlalchemy>=2.0",
+    "sqlalchemy>=2.0,<2.1",
     "uvicorn[standard]>=0.53.0",
 ]
 
