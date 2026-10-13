@@ -5,7 +5,8 @@
 
 # [무엇을 검증하나] 서비스 예측 수준 진단 스크립트(scripts/check_prediction_level.py)의
 # predicted_cells가 정해진 범위만 읽는지 확인한다: 시각은 since~until(끝 포함), 발표는 last_issue
-# 이하, 버전 접두어가 맞는 것만, 시각마다 가장 최근 발표의 값 하나, 공휴일 시간 제외.
+# 이하, 버전 접두어가 맞는 것만, 시각마다 가장 최근 발표의 값 하나, 공휴일 시간 제외. 해마다의
+# 비교(compare_year)가 공통 칸이 없는 해에서 멈추지 않는지도 본다.
 # [왜 중요한가] 이 진단의 수치(407,847행·149시간, 예측 ÷ 실제 0.98·1.02·1.15)는
 # docs/experiments.md에 적혀 있다. 예측이 계속 쌓이는 DB에서 범위를 고정하지 않으면 다시 돌릴 때마다
 # 결과가 바뀌어 문서 값을 재현할 수 없다(4eb819c). 공휴일 제외는 실제 쪽과 규칙을 맞추려고
@@ -94,3 +95,24 @@ def test_predicted_cells_drop_holidays_like_the_actual_side(pg_engine):
     assert predicted == {("ST-1", False, 20): 3.0}
     assert weights == {("ST-1", False, 20): 1}
     assert seen == [wednesday]
+
+
+# 회귀 테스트: 비교할 해에 예측 쪽과 같은 칸이 하나도 없으면(warehouse에 없는 해를 --years로 준 경우
+# 등) 전에는 weighted_ratio가 0으로 나누기 오류로 실행 전체를 멈췄다. 이제 그 해는 '비교할 칸
+# 없음'으로 적고, 칸이 있는 해는 예전과 같은 형식의 줄을 낸다.
+def test_compare_year_without_shared_cells_does_not_divide_by_zero():
+    import pytest
+
+    script = load_script()
+    predicted = {("ST-1", False, 8): 3.0, ("ST-1", True, 8): 1.0}
+    weights = {("ST-1", False, 8): 2, ("ST-1", True, 8): 1}
+
+    assert script.compare_year(2022, predicted, weights, {}) == "2022: cells 0/2  비교할 칸 없음"
+    with pytest.raises(ValueError, match="칸"):
+        script.weighted_ratio(predicted, weights, {}, [])
+
+    # 칸이 있으면 예측 쪽 시간 수로 가중: 예측 (3·2 + 1·1) / 3, 실제 (2·2 + 2·1) / 3
+    actual = {("ST-1", False, 8): 2.0, ("ST-1", True, 8): 2.0}
+    assert script.compare_year(2024, predicted, weights, actual) == (
+        "2024: cells 2/2  predicted 2.333  actual 2.000  ratio 1.167  weekday 1.500  offday 0.500"
+    )

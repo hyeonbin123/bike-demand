@@ -27,7 +27,8 @@
 # [이력] 커밋 4eb819c: 처음에는 --since 뒤 모든 예측을 읽어 서비스가 예측을 쌓을수록 기본 실행
 # 결과가 문서 값(407,847행·149시간)에서 597,435행·218시간으로 바뀌었다. 그래서 --until과
 # --last-issue로 범위를 고정했다. 커밋 d5b8025: 예측 쪽에서도 공휴일 시간을 빼도록 고쳤다.
-# [연결] tests/test_check_prediction_level.py가 범위 경계와 공휴일 제외를 확인한다.
+# [연결] tests/test_check_prediction_level.py가 범위 경계, 공휴일 제외, 공통 칸이 없는 해의 처리를
+# 확인한다.
 
 from __future__ import annotations
 
@@ -126,13 +127,34 @@ def actual_cells(con: duckdb.DuckDBPyConnection, year: int, start: str, end: str
 
 # 고른 칸들에서 예측 쪽 시간 수로 가중한 (예측 평균, 실제 평균, 예측 ÷ 실제)를 돌려준다. 같은
 # 가중치를 양쪽에 써서 대여소·요일·시각 구성 차이가 비율에 끼어들지 않게 한다(docs/experiments.md
-# 진단 절 '예측 쪽 시간 수로 가중'). keys가 비면 0으로 나누기 오류가 난다. 실행부는 평일·쉬는 날
-# 부분 호출만 비었는지 확인하고, 해마다의 전체 호출은 따로 막지 않는다.
+# 진단 절 '예측 쪽 시간 수로 가중'). keys가 비면 나눌 수가 없어 ValueError를 낸다. 해마다의 비교는
+# 아래 compare_year가 칸이 없는 해를 먼저 걸러 이 오류가 나지 않는다.
 def weighted_ratio(predicted: dict, weights: dict, actual: dict, keys: list) -> tuple:
+    if not keys:
+        raise ValueError("비교할 칸이 없음")
     n = sum(weights[k] for k in keys)
     p = sum(predicted[k] * weights[k] for k in keys)
     a = sum(actual[k] * weights[k] for k in keys)
     return p / n, a / n, p / a
+
+
+# 한 해의 결과 한 줄. 두 쪽에 다 있는 칸만 비교한다. 최근에 생긴 대여소는 지난 해 같은 시기 칸이
+# 없어 빠진다(진단 한계에 적힌 점). 출력의 cells a/b가 쓰인 칸 수를 보여 준다. warehouse에 없는
+# 해(예: --years 2022)처럼 공통 칸이 하나도 없으면 0으로 나누지 않고 '비교할 칸 없음'으로 적는다.
+# 호출 위치: 아래 실행부(해마다 한 번), tests/test_check_prediction_level.py.
+def compare_year(year: int, predicted: dict, weights: dict, actual: dict) -> str:
+    keys = [key for key in predicted if key in actual]
+    if not keys:
+        return f"{year}: cells 0/{len(predicted)}  비교할 칸 없음"
+    mean_p, mean_a, ratio = weighted_ratio(predicted, weights, actual, keys)
+    line = f"{year}: cells {len(keys)}/{len(predicted)}  predicted {mean_p:.3f}"
+    line += f"  actual {mean_a:.3f}  ratio {ratio:.3f}"
+    # 평일 칸과 쉬는 날 칸의 비율을 따로도 적는다(문서 표의 '평일', '쉬는 날' 열).
+    for offday, label in ((False, "weekday"), (True, "offday")):
+        subset = [key for key in keys if key[1] == offday]
+        if subset:
+            line += f"  {label} {weighted_ratio(predicted, weights, actual, subset)[2]:.3f}"
+    return line
 
 
 if __name__ == "__main__":
@@ -167,18 +189,7 @@ if __name__ == "__main__":
     con = duckdb.connect(str(args.warehouse), read_only=True)
     for year in args.years:
         actual = actual_cells(con, year, args.start, args.end)
-        # 두 쪽에 다 있는 칸만 비교한다. 최근에 생긴 대여소는 지난 해 같은 시기 칸이 없어
-        # 빠진다(진단 한계에 적힌 점). 출력의 cells a/b가 쓰인 칸 수를 보여 준다.
-        keys = [key for key in predicted if key in actual]
-        mean_p, mean_a, ratio = weighted_ratio(predicted, weights, actual, keys)
-        line = f"{year}: cells {len(keys)}/{len(predicted)}  predicted {mean_p:.3f}"
-        line += f"  actual {mean_a:.3f}  ratio {ratio:.3f}"
-        # 평일 칸과 쉬는 날 칸의 비율을 따로도 적는다(문서 표의 '평일', '쉬는 날' 열).
-        for offday, label in ((False, "weekday"), (True, "offday")):
-            subset = [key for key in keys if key[1] == offday]
-            if subset:
-                line += f"  {label} {weighted_ratio(predicted, weights, actual, subset)[2]:.3f}"
-        print(line)
+        print(compare_year(year, predicted, weights, actual))
     # 해마다 상반기(1~6월) 대여소당 시간당 평균. 가장 최근에 공개된 반기(2026 상반기)의 수준이
     # 2025년과 비슷한지 보려는 값이다(문서: 2026 1.500, 2025 1.483).
     halves = con.execute(

@@ -151,6 +151,27 @@ def test_predict_and_store_writes_and_overwrites(pg_engine, small_warehouse, tmp
     assert min(r.hour_start for r in rows) == datetime(2026, 9, 17, 8, tzinfo=KST)
 
 
+# 회귀 테스트: latest_forecast는 서울 격자(60·127)의 가장 최근 발표만 읽는다. 전에는 발표 시각으로만
+# 걸러, 다른 격자의 예보가 DB에 있으면 그 격자의 더 늦은 발표를 고르거나 같은 발표의 두 격자 값을
+# 섞었다(forecast_gap·shortage_eval은 이미 60·127로 거름). 지금 수집은 서울 격자 하나뿐이다.
+def test_latest_forecast_reads_only_the_seoul_grid(pg_engine):
+    seoul_base = datetime(2026, 9, 17, 5, tzinfo=KST)
+    other_base = datetime(2026, 9, 17, 8, tzinfo=KST)  # 다른 격자의 더 늦은 발표
+    target = datetime(2026, 9, 17, 10, tzinfo=KST)
+    with pg_engine.begin() as conn:
+        conn.execute(
+            WeatherForecast.__table__.insert(),
+            [{"base_datetime": base, "fcst_datetime": target, "category": "TMP",
+              "nx": nx, "ny": ny, "value": value}
+             for base, nx, ny, value in ((seoul_base, 60, 127, "20"),
+                                         (seoul_base, 61, 128, "30"),
+                                         (other_base, 61, 128, "35"))],
+        )  # fmt: skip
+    base, weather = predict.latest_forecast(pg_engine)
+    assert base == seoul_base
+    assert weather[target - timedelta(hours=1)]["temp_c"] == 20.0
+
+
 # 가장 최근 스냅샷이 6시간 한도보다 오래됐으면(하루 전) 예측하지 않고 RuntimeError. 수집이 멈춘 동안
 # 옛 대여소 목록으로 예측을 계속 쌓지 않게 한다.
 def test_predict_refuses_stale_snapshot(pg_engine, small_warehouse, tmp_path):

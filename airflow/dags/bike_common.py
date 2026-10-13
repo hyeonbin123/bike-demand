@@ -32,7 +32,8 @@ PYTHON = f"{PROJECT}/.venv/bin/python"
 
 # PYTHONUTF8=1은 dbt 모델 SQL에 한글 주석이 있어 필요하다. PYTHONIOENCODING=utf-8은 한국어로 된
 # print·오류 메시지가 Airflow 작업 로그에서 깨지지 않게 한다.
-# 모든 명령 앞에 붙인다: 저장소 루트로 이동, 한국어 출력, 오늘 날짜(KST)
+# 모든 명령 앞에 붙인다: 저장소 루트로 이동, 한국어 출력. 날짜는 여기서 넣지 않고 각 명령이 KST로
+# 정한다(예: collect-realtime은 수집 시각의 KST 날짜).
 PREFIX = f"cd {PROJECT} && export PYTHONIOENCODING=utf-8 PYTHONUTF8=1 && "
 
 # DEFAULT_ARGS: 모든 작업의 기본값. 실패하면 2분 뒤 최대 2번 다시 시도한다. 공공 API의 일시 오류나

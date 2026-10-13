@@ -196,7 +196,8 @@ def window_hits_zero(snaps: Snapshots, indices: np.ndarray, columns: np.ndarray)
 
 # 보고만 하는 재배치 트럭 지표. 0대 도달과 회복에 트럭 재배치가 섞이는 정도를 보려는 것이다(계획
 # '재배치 트럭'). 기준 스냅샷과 창 안 스냅샷을 차례로 놓고 이웃한 두 스냅샷(둘 다 값이 있을 때)의
-# 변화를 본다.
+# 변화를 본다. 계획 문장의 '이웃한 10분 칸'과 달리 10분 칸으로 묶지 않으며, 기준 스냅샷 → 창 안 첫
+# 스냅샷 변화도 센다(docs/experiments.md 'v5 기록 보충 3').
 def truck_events(
     snaps: Snapshots, ref: int, indices: np.ndarray, columns: np.ndarray, jump: int = RECOVERY_JUMP
 ) -> dict[str, np.ndarray]:

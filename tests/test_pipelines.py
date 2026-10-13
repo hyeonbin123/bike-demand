@@ -2,7 +2,7 @@
 # 스냅샷을 빠짐없이, 중복 없이 적재하는지 확인한다.
 # - 적재 날짜는 수집 시각(KST)의 날짜다(23:59:59.9 수집분도 그날로)
 # - 적재가 실패한 지난 날은 loaded.txt 기록과 원본 목록을 비교해 다음 정상 실행이 회수한다(자정 넘어
-#   재시도, 0시대 내내 장애)
+#   재시도, 0시대 내내 장애). 한 날이 계속 실패해도 다른 날(오늘 포함)은 같은 실행에서 적재한다
 # - 겹친 실행은 잠금으로 막고, 오래된 잠금은 가져가며, 잠금을 빼앗긴 실행도 실제로 적재한 것만
 #   기록한다
 # - latest-trip-month 명령의 최신 달·말일 계산
@@ -221,6 +221,7 @@ def test_overlapping_runs_do_not_rebuild_and_load_at_the_same_time(tmp_path, mon
 def test_taken_over_lock_cannot_mark_snapshots_that_were_not_loaded(tmp_path, monkeypatch):
     """느린 실행 A의 잠금을 30분 뒤 B가 가져가도, 각자 만든 파일을 적재하므로 기록이 적재를 앞서지
     않는다. A는 끝날 때 B의 잠금을 지우지 않는다(T44, codex 라운드 6 재현)."""
+    import io
     import os
     import time
 
@@ -237,8 +238,11 @@ def test_taken_over_lock_cannot_mark_snapshots_that_were_not_loaded(tmp_path, mo
     a_old: list[bytes] = []
     loaded_by_run: list[set[str]] = []
 
+    # 파일을 바이트로 먼저 읽어 메모리에서 연다. pq.read_table(path)는 파일 핸들(메모리 맵)을
+    # 바로 닫지 않을 때가 있어, 이어지는 os.replace가 Windows에서 가끔 WinError 32로
+    # 실패했다(테스트만의 흔들림).
     def names_in(path):
-        rows = pq.read_table(path).to_pylist()
+        rows = pq.read_table(io.BytesIO(path.read_bytes())).to_pylist()
         return {
             datetime.fromisoformat(r["fetched_at"]).astimezone(realtime.KST).strftime("%H%M%S")
             + ".json"
@@ -283,3 +287,45 @@ def test_lock_release_keeps_a_lock_taken_over_by_another_run(tmp_path):
     with pipelines._load_lock(tmp_path):
         assert lock.exists()
     assert not lock.exists()
+
+
+# 회귀 테스트: 덜 적재된 지난 날 하나가 계속 실패해도(그날 원본에 적재할 수 없는 행이 있는 경우
+# 등) 다른 지난 날과 오늘은 같은 실행에서 적재·기록된다. 전에는 오래된 날부터 차례로 적재하다 첫
+# 실패에서 멈춰, 그 날이 회수 범위(7일)를 벗어날 때까지 매 실행에서 오늘 적재가 진행되지 않았다.
+# 실패한 날은 기록이 남지 않아 다음 실행이 다시 시도하고, 실행은 실패한 날짜를 담은 LoadFailed로
+# 끝난다(Airflow 작업 실패로 보임). DB 없이 적재 함수를 가짜로 바꿔 돈다.
+def test_a_failing_past_day_does_not_block_other_days(tmp_path, monkeypatch):
+    import pytest
+
+    from bike_demand import pipelines
+
+    raw, bronze = tmp_path / "raw", tmp_path / "bronze"
+    client = httpx.Client(transport=httpx.MockTransport(bike_list))
+    for at in (datetime(2026, 9, 15, 12, 0), datetime(2026, 9, 16, 12, 0)):
+        realtime.download(raw, SECRET, at.replace(tzinfo=realtime.KST), client=client)
+    calls = []
+
+    def load_file(engine, path):
+        calls.append(day_of(path))
+        if day_of(path) == date(2026, 9, 15):
+            raise ValueError("적재할 수 없는 행")
+        return 2, 0
+
+    monkeypatch.setattr(pipelines.load, "load_realtime_file", load_file)
+    now = datetime(2026, 9, 17, 0, 10, tzinfo=realtime.KST)
+    with pytest.raises(pipelines.LoadFailed, match="2026-09-15") as failed:
+        pipelines.collect_realtime(None, raw, bronze, SECRET, now, client)
+
+    assert isinstance(failed.value.__cause__, ValueError)
+    assert calls == [date(2026, 9, 15), date(2026, 9, 16), date(2026, 9, 17)]
+    assert not (bronze / "date=2026-09-15" / "loaded.txt").exists()
+    for day in ("2026-09-16", "2026-09-17"):
+        assert (bronze / f"date={day}" / "loaded.txt").exists()
+        assert (bronze / f"date={day}" / "snapshots.parquet").exists()
+    assert not list(bronze.glob("date=*/*.part"))
+
+    # 다음 실행은 실패한 날만 다시 시도하고 오늘을 적재한다
+    calls.clear()
+    with pytest.raises(pipelines.LoadFailed):
+        pipelines.collect_realtime(None, raw, bronze, SECRET, now.replace(minute=20), client)
+    assert calls == [date(2026, 9, 15), date(2026, 9, 17)]

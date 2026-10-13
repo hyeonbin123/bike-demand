@@ -3,7 +3,8 @@
 - 대여소: 가장 최근 스냅샷(`realtime_snapshots`)에 나온 곳. 학습에 없던 대여소는 새 코드(학습에
   없던 범주)와 서비스 DB의 거치대 수·좌표로 예측한다(docs/experiments.md 측정 전 보충과 같은 처리)
 - 시간: 현재 시각이 든 시간부터 `horizon_hours`개 중 최신 예보가 있는 시간
-- 날씨: 가장 최근 발표(`weather_forecasts`)를 `forecast_weather.hourly_weather`로 바꾼 값
+- 날씨: 서울 격자(60·127)의 가장 최근 발표(`weather_forecasts`)를
+  `forecast_weather.hourly_weather`로 바꾼 값
 - model_version: `{모델 이름}-fcst{발표 시각 YYYYMMDDHHMM}`. 같은 버전으로 다시 돌리면 값을 덮어쓴다
 """
 
@@ -32,8 +33,9 @@ import numpy as np
 from sqlalchemy import Engine, func, select
 from sqlalchemy.dialects.postgresql import insert
 
-# 프로젝트 모듈: 학습 시점 산출물, 예보 → 날씨 특징 변환, 특징 목록과 공개 반기 번호, 서비스 DB
-# 테이블.
+# 프로젝트 모듈: 수집하는 서울 예보 격자, 학습 시점 산출물, 예보 → 날씨 특징 변환, 특징 목록과 공개
+# 반기 번호, 서비스 DB 테이블.
+from bike_demand.ingest.forecast import SEOUL_NX, SEOUL_NY
 from bike_demand.model.artifacts import Artifacts
 from bike_demand.model.forecast_weather import hourly_weather
 from bike_demand.model.frames import FEATURES, published_half
@@ -171,17 +173,20 @@ def _code(value) -> float:
     return math.nan if value is None else float(value)
 
 
-# DB에서 가장 최근 발표의 예보 전체를 읽어 {hour_start: 날씨 특징}으로 바꾼다. 예보가 하나도 없으면
-# None. 발표 시각만으로 거르고 격자(nx, ny)는 거르지 않는데, 지금은 서울 격자 하나만 수집한다.
+# DB에서 서울 격자(60·127)의 가장 최근 발표 예보를 읽어 {hour_start: 날씨 특징}으로 바꾼다. 예보가
+# 하나도 없으면 None. 발표 시각과 격자를 함께 걸러, 다른 격자의 예보가 DB에 있어도 그 발표를
+# 고르거나 두 격자의 값을 섞지 않는다(forecast_gap·shortage_eval과 같은 격자 조건).
 def latest_forecast(engine: Engine) -> tuple[datetime, dict[datetime, dict[str, float]]] | None:
+    grid = (WeatherForecast.nx == SEOUL_NX) & (WeatherForecast.ny == SEOUL_NY)
     with engine.connect() as conn:
-        base = conn.execute(select(func.max(WeatherForecast.base_datetime))).scalar_one()
+        latest = select(func.max(WeatherForecast.base_datetime)).where(grid)
+        base = conn.execute(latest).scalar_one()
         if base is None:
             return None
         rows = conn.execute(
             select(
                 WeatherForecast.fcst_datetime, WeatherForecast.category, WeatherForecast.value
-            ).where(WeatherForecast.base_datetime == base)
+            ).where(grid, WeatherForecast.base_datetime == base)
         ).all()
     return base, hourly_weather((r[0], r[1], r[2]) for r in rows)
 

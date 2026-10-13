@@ -43,11 +43,19 @@ def test_profile_uses_history_only_and_baselines_fall_back(small_warehouse):
 
 
 # only_active_stations=True면 그 기간에 대여가 있는 대여소만 평가 행에 넣는다(계획의 '평가 대상
-# 행'). 1/1~1/15에는 ST-1만 남는다.
+# 행'). fixture의 ST-2는 1/16 이후에만 격자 행이 있어 1/1~1/15에는 거르지 않아도 나오지 않는다.
+# 그래서 이 기간에 대여 0건인 ST-2 격자 행을 더해, 거르는 조건이 있어야만 ST-1만 남게 만든다.
 def test_inactive_stations_are_dropped_from_evaluation(small_warehouse):
+    small_warehouse.execute("""
+        insert into int_station_hour_grid
+        select 'ST-2', hour_start, 0 from dim_hours where hour_start < '2024-01-16'
+    """)
     window = frames.Window(rows=("2024-01-01", "2024-01-16"), history=("2024-01-01", "2024-01-16"))
     frame = frames.load_frame(small_warehouse, window, only_active_stations=True)
     assert set(np.unique(frame["station_code"])) == {0.0}
+    # 거르지 않으면 대여 0건인 ST-2 행도 들어온다. 위 단언이 거르는 조건을 실제로 확인한다는 뜻이다.
+    unfiltered = frames.load_frame(small_warehouse, window, only_active_stations=False)
+    assert set(np.unique(unfiltered["station_code"])) == {0.0, 1.0}
 
 
 # 지표 계산을 손으로 셀 수 있는 4행으로 확인한다. MAE (1+0+1+4)/4, 출퇴근(7시) MAE 4, WAPE = 오차 합

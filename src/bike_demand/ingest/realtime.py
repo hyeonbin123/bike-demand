@@ -40,6 +40,8 @@ import pyarrow.parquet as pq
 from bike_demand.ingest._http import private_request, reflects_secret
 
 # ENDPOINT: 서울 열린데이터광장 OpenAPI 주소. 인증키가 쿼리가 아니라 URL 경로에 들어간다(_get_page).
+# 이용 안내가 http 주소(포트 8088)만 제공하고 HTTPS 안내가 없어 http 그대로 둔다. 그래서 키가 암호화
+# 없이 전송된다(README 한계).
 # PAGE_SIZE: 한 번에 요청하는 행 수(시작~끝 번호 범위 1,000개).
 # FIELDS: API 필드 이름 → 프로젝트 컬럼 이름. bronze에는 이 필드들만 옮기고, 원본 JSON에는 응답
 # 전체가 남는다. parkingBikeTotCnt가 서비스의 '지금 자전거 수'(bike_count)다.

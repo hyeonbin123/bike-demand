@@ -78,6 +78,13 @@ class LoadBusy(RuntimeError):
     """다른 실행이 적재 중이다. Airflow 재시도나 다음 실행이 이어받는다."""
 
 
+# 적재할 날 중 하나라도 실패하면 모든 날을 시도한 뒤 내는 예외. 실패한 날짜와 예외 종류를 메시지에
+# 담고, 첫 실패를 원인(__cause__)으로 잇는다. 실패한 날은 loaded.txt가 원본과 달라 다음 실행이 다시
+# 시도한다.
+class LoadFailed(RuntimeError):
+    """적재에 실패한 날이 있다. 성공한 날은 이미 적재·기록됐다."""
+
+
 # bronze 폴더에 잠금 파일을 만들어 한 번에 한 실행만 재생성·적재·기록 구간에 들어가게 한다.
 # - O_CREAT | O_EXCL: 파일이 없을 때만 원자적으로 만든다. 이미 있으면 다른 실행이 들어가 있는 것이라
 #   LoadBusy.
@@ -141,8 +148,9 @@ def _mark_loaded(bronze_dir: Path, day: date, names: list[str]) -> None:
 # 서비스 DB에 적재한 뒤 결과 요약 사전을 돌려준다.
 # now와 client는 테스트에서 시각과 HTTP 응답을 고정하려고 받는다(운영에서는 None).
 # 주의: 실행마다 그날 원본 전체로 Parquet을 다시 만들고 적재를 시도한다(이미 있는 행은 적재 단계가
-# 건너뜀). 덜 적재된 지난 날을 오늘보다 먼저 처리하므로, 지난 날 하나가 계속 실패하면 오늘 적재도 그
-# 실행에서는 진행되지 않는다.
+# 건너뜀). 한 날의 적재가 실패해도 나머지 날(오늘 포함)은 계속 적재하고, 실패한 날이 있으면 끝에
+# LoadFailed로 실행을 실패 처리한다. 전에는 첫 실패에서 멈춰, 계속 실패하는 지난 날 하나가 최대 7일
+# 동안 오늘 적재를 막았다.
 def collect_realtime(
     engine: Engine,
     raw_dir: Path,
@@ -157,6 +165,8 @@ def collect_realtime(
     DB 장애가 몇 시간 이어지면 수집 날짜가 이미 지나 있다(T35, T39). 그래서 날마다 적재에 성공한
     원본 이름을 bronze 폴더의 loaded.txt에 남기고, 최근 RECOVER_DAYS일 중 원본 목록과 기록이 다른
     날을 오늘과 함께 다시 적재한다. 적재는 이미 있는 행을 건너뛰므로 중복되지 않는다.
+    한 날의 적재가 실패해도 나머지 날은 계속 적재·기록하고, 실패한 날이 있으면 모든 날을 시도한 뒤
+    LoadFailed를 낸다(계속 실패하는 지난 날 하나가 오늘 적재를 막지 않게).
     수집한 원본은 먼저 저장하고, 재생성부터 기록까지는 보통 한 번에 한 실행만 한다(겹치면 LoadBusy).
     7일보다 오래된 날은 매 실행이 살피지 않으므로 `realtime.to_parquet`로 Parquet을 다시 만든 뒤
     `serving.load realtime --day`로 직접 적재한다. 이 수동 적재는 이미 있는 행을 건너뛸 뿐
@@ -178,6 +188,8 @@ def collect_realtime(
         ]
         # names는 Parquet을 만들기 전에 읽는다. 그 뒤에 새 원본이 생겨도 Parquet에는 들어가고
         # 기록에는 빠질 뿐이라, 기록이 실제 적재보다 앞서는 일은 없다(LOCK_NAME 위 주석).
+        # 한 날이 실패해도 멈추지 않고 다음 날로 넘어간다. 실패는 모아 두었다가 잠금을 푼 뒤 낸다.
+        failed: list[tuple[date, Exception]] = []
         for target in [*pending, day]:
             names = _raw_names(raw_dir, target)
             parquet = bronze_dir / f"date={target:%Y-%m-%d}" / "snapshots.parquet"
@@ -189,6 +201,9 @@ def collect_realtime(
                 rows = realtime.to_parquet(raw_dir, own, target)
                 snapshots, stations = load.load_realtime_file(engine, own)
                 os.replace(own, parquet)
+            except Exception as exc:
+                failed.append((target, exc))
+                continue
             finally:
                 own.unlink(missing_ok=True)
             # 적재가 예외 없이 끝난 날만 기록한다. 실패한 날은 기록이 원본과 달라 다음 실행이 다시
@@ -199,6 +214,11 @@ def collect_realtime(
                 "snapshots_inserted": snapshots,
                 "new_stations": stations,
             }
+    # 실패한 날짜와 예외 종류만 메시지에 넣고(원본 내용·DB 주소는 넣지 않음), 첫 실패를 원인으로
+    # 잇는다.
+    if failed:
+        summary = ", ".join(f"{d.isoformat()} {type(e).__name__}" for d, e in failed)
+        raise LoadFailed(f"실시간 적재 실패: {summary}") from failed[0][1]
     # 요약: Parquet 행 수는 오늘 것, 넣은 스냅샷·새 대여소 수는 회수한 날까지 합친 값. Airflow
     # 로그에 이 사전이 찍힌다.
     today = result["days"][day.isoformat()]
