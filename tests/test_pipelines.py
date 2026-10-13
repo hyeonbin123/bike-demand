@@ -1,5 +1,19 @@
+# [무엇을 검증하나] Airflow collect_realtime 작업의 본체(pipelines.collect_realtime)가 실시간
+# 스냅샷을 빠짐없이, 중복 없이 적재하는지 확인한다.
+# - 적재 날짜는 수집 시각(KST)의 날짜다(23:59:59.9 수집분도 그날로)
+# - 적재가 실패한 지난 날은 loaded.txt 기록과 원본 목록을 비교해 다음 정상 실행이 회수한다(자정 넘어
+#   재시도, 0시대 내내 장애)
+# - 겹친 실행은 잠금으로 막고, 오래된 잠금은 가져가며, 잠금을 빼앗긴 실행도 실제로 적재한 것만
+#   기록한다
+# - latest-trip-month 명령의 최신 달·말일 계산
+# [왜 중요한가] 실시간 스냅샷은 지나가면 다시 받을 수 없다. 적재가 조용히 빠지면 부족 위험 화면과 v5
+# 측정의 정답 자료에 구멍이 생긴다.
+# [방식] 실시간 API는 MockTransport로 대여소 2곳을 돌려주고, DB 적재 함수(load.load_realtime_file)는
+# monkeypatch로 실패·지연을 흉내 낸다. DB가 필요한 테스트는 pg_engine(임시 PostgreSQL)을 쓴다.
+
 from datetime import date, datetime
 
+# httpx: 가짜 실시간 API. sqlalchemy: 적재된 스냅샷 수·시각 확인.
 import httpx
 from sqlalchemy import func, select
 
@@ -10,11 +24,14 @@ from bike_demand.serving.models import RealtimeSnapshot
 SECRET = "fake-key"
 
 
+# 적재 함수가 받은 Parquet 경로에서 날짜를 읽어, 어느 날을 적재하려 했는지 기록하는 데 쓴다.
 def day_of(parquet_path):
     """bronze/date=YYYY-MM-DD/파일 → 그 날짜."""
     return date.fromisoformat(parquet_path.parent.name.removeprefix("date="))
 
 
+# 가짜 bikeList 응답: 대여소 2곳(ST-1, ST-2), 각 자전거 3대. 한 번 수집할 때마다 스냅샷 2행이
+# 생긴다.
 def bike_list(request: httpx.Request) -> httpx.Response:
     rows = [
         {"rackTotCnt": "10", "stationName": f"{n}. 대여소", "parkingBikeTotCnt": "3",
@@ -32,6 +49,9 @@ def bike_list(request: httpx.Request) -> httpx.Response:
     return httpx.Response(200, json=body)
 
 
+# 23:59:59.9에 수집한 스냅샷은 적재가 자정을 넘겨 끝나도 09-16의 Parquet과 DB에 들어간다. 수집과
+# 적재가 따로 '오늘'을 계산하던 때 생길 수 있던 날짜 어긋남을 막는다. 처음 보는 대여소 2곳도 함께
+# 추가된다.
 def test_snapshot_taken_just_before_midnight_is_loaded_under_its_own_day(pg_engine, tmp_path):
     raw, bronze = tmp_path / "raw", tmp_path / "bronze"
     just_before_midnight = datetime(2026, 9, 16, 23, 59, 59, 900000, tzinfo=realtime.KST)
@@ -47,6 +67,8 @@ def test_snapshot_taken_just_before_midnight_is_loaded_under_its_own_day(pg_engi
     assert fetched.astimezone(realtime.KST).date() == date(2026, 9, 16)
 
 
+# 원본 파일 이름 순서와 상관없이 가장 최근 달(2026-12)을 고르고, 말일은 윤년 2월(2028-02-29)까지
+# 맞게 계산한다. refresh_history DAG가 날씨 수집 끝 달과 dbt calendar_end에 넘기는 값이다.
 def test_latest_trip_month_and_last_day(tmp_path):
     from bike_demand.pipelines import last_day, latest_trip_month
 
@@ -59,6 +81,9 @@ def test_latest_trip_month_and_last_day(tmp_path):
     assert last_day("2028-02") == "2028-02-29"
 
 
+# 23:59:59 실행은 원본 저장 뒤 적재가 한 번 실패한다. 00:02 실행은 기록이 없는 전날(09-16)을 먼저
+# 다시 적재하고 오늘을 적재해 스냅샷 4행이 된다. 01:00 실행은 이미 기록이 원본과 같은 전날을
+# 건드리지 않고 오늘만 적재한다(불필요한 재적재 없음).
 def test_retry_after_midnight_recovers_the_previous_day(pg_engine, tmp_path, monkeypatch):
     """23:59:59 수집 성공 → 적재 실패 → 00:02 다음 실행에서 전날 스냅샷도 적재된다(T35)."""
     from bike_demand.serving import load
@@ -98,6 +123,11 @@ def test_retry_after_midnight_recovers_the_previous_day(pg_engine, tmp_path, mon
     assert calls == [date(2026, 9, 17)]
 
 
+# DB 장애가 23:59 실행과 00:02 실행 모두를 실패시키면 전날 loaded.txt가 생기지 않는다. 03:10에 DB가
+# 돌아오면 그 실행이 전날(1개 원본)과 오늘(00:02·03:10 원본 2개)을 모두 적재하고, 전날 기록에는 실제
+# 적재한 원본 이름만 남는다.
+# 다음 실행은 오늘만 다시 적재하는데, 이미 있는 스냅샷은 건너뛰므로 행은 오늘 새 수집분만큼만 늘어
+# 8행이다(멱등).
 def test_failures_through_the_midnight_hour_are_recovered_later(pg_engine, tmp_path, monkeypatch):
     """23:59와 0시대 재시도가 모두 적재에 실패해도 1시대 이후 정상 실행이 전날을 회수한다(T39)."""
     from bike_demand.serving import load
@@ -144,6 +174,9 @@ def test_failures_through_the_midnight_hour_are_recovered_later(pg_engine, tmp_p
     assert count == 8
 
 
+# 새 잠금 파일이 있으면 원본 JSON은 저장하되 적재는 하지 않고 LoadBusy를 낸다(적재 함수가 불리면
+# 실패). 잠금 시각을 STALE_LOCK_SECONDS보다 오래되게 바꾸면 다음 실행이 그 잠금을 지우고 들어가,
+# 쌓인 원본 2개(4행)를 적재·기록한 뒤 자기 잠금을 푼다. engine은 적재를 가짜로 바꿔 None으로 둔다.
 def test_overlapping_runs_do_not_rebuild_and_load_at_the_same_time(tmp_path, monkeypatch):
     """적재 구간은 한 실행만: 잠금이 있으면 원본만 남기고 LoadBusy, 오래된 잠금은 지운다(T42)."""
     import os
@@ -178,6 +211,13 @@ def test_overlapping_runs_do_not_rebuild_and_load_at_the_same_time(tmp_path, mon
     assert loaded == ["120000.json", "121000.json"]
 
 
+# 가장 까다로운 겹침을 재현한다. 실행 A(23:40)가 적재하는 도중 잠금이 30분 넘게 묵어 실행 B(23:50)가
+# 잠금을 가져가 끝까지 돌고, B가 적재하기 직전에는 늦게 끝난 A의 재생성이 공용 snapshots.parquet을
+# 옛 내용으로 덮어쓴다.
+# 각 실행이 자기 이름의 임시 Parquet을 적재하므로 공용 파일이 덮여도 B는 23:40·23:50을 모두 적재하고
+# 그만큼만 기록한다. A는 Parquet을 만들기 전에 본 원본(23:40)만 기록하므로 기록이 적재를 앞서지
+# 않는다(빠진 23:50은 기록에 없어 다음 실행이 다시 확인). A는 끝날 때 B의 잠금을 지우지 않고(토큰
+# 비교), 임시 .part 파일도 남지 않는다.
 def test_taken_over_lock_cannot_mark_snapshots_that_were_not_loaded(tmp_path, monkeypatch):
     """느린 실행 A의 잠금을 30분 뒤 B가 가져가도, 각자 만든 파일을 적재하므로 기록이 적재를 앞서지
     않는다. A는 끝날 때 B의 잠금을 지우지 않는다(T44, codex 라운드 6 재현)."""
@@ -230,6 +270,8 @@ def test_taken_over_lock_cannot_mark_snapshots_that_were_not_loaded(tmp_path, mo
     assert not list(day_dir.glob("*.part"))
 
 
+# 잠금 안에서 다른 실행이 잠금 파일 내용(토큰)을 바꿔 놓으면, 끝날 때 그 잠금을 지우지 않는다. 자기
+# 토큰 그대로면 끝날 때 지운다.
 def test_lock_release_keeps_a_lock_taken_over_by_another_run(tmp_path):
     from bike_demand import pipelines
 

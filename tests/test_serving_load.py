@@ -1,5 +1,16 @@
+# [무엇을 검증하나] 서비스 DB 적재(src/bike_demand/serving/load.py)가 멱등인지와 각 테이블의 규칙을
+# 실제 PostgreSQL(임시 DB)에서 확인한다.
+# - 대여소: warehouse에서 upsert(다시 넣으면 고친 값으로 바뀌고 행은 늘지 않음), 실시간에만 나온
+#   대여소는 추가만 하고 과거 이력 대여소는 덮어쓰지 않음, '102. 이름' 꼴 이름 나누기
+# - 스냅샷·예보: 같은 키는 건너뛰어 두 번째 적재는 0행, 시각은 +09:00(KST)으로 저장·조회
+# - 마이그레이션: base까지 내렸다가 head로 올리기, 마이그레이션이 실패해도 임시 DB가 지워짐
+# [왜 중요한가] 수집 작업은 10분마다 그날 Parquet 전체를 다시 적재하므로 멱등이 깨지면 스냅샷이
+# 곧바로 중복된다(docs/serving-schema.md 적재 규칙).
+
 from datetime import date, datetime, timedelta, timezone
 
+# duckdb: 작은 warehouse 파일(dim_stations만) 만들기. pyarrow: ingest 모듈의 SCHEMA(모든 열
+# 문자열)로 bronze Parquet 만들기. sqlalchemy: 적재 결과 조회.
 import duckdb
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -13,12 +24,16 @@ from bike_demand.serving.models import RealtimeSnapshot, Station, WeatherForecas
 KST = timezone(timedelta(hours=9))
 
 
+# 실시간 API 이름 '102. 망원역 1번출구 앞'은 번호 102와 이름으로 나누고, 번호가 없으면 이름만, 값이
+# 없으면 둘 다 None.
 def test_split_station_name():
     assert load.split_station_name("102. 망원역 1번출구 앞") == (102, "망원역 1번출구 앞")
     assert load.split_station_name("이름만") == (None, "이름만")
     assert load.split_station_name(None) == (None, None)
 
 
+# dim_stations만 있는 warehouse 파일. ST-1은 이름을 바꿔 다시 만들 수 있고, ST-2는
+# 좌표·자치구·거치대 수가 없는 대여소다.
 def make_warehouse(path, name="강남역"):
     con = duckdb.connect(str(path))
     con.execute(f"""
@@ -30,6 +45,8 @@ def make_warehouse(path, name="강남역"):
     con.close()
 
 
+# 같은 warehouse를 두 번 적재해도 2행이고, 두 번째에 바뀐 이름이 반영된다(upsert). 좌표가 없는
+# 대여소도 null로 들어가고 출처는 history.
 def test_stations_upsert_is_idempotent_and_updates(pg_engine, tmp_path):
     warehouse = tmp_path / "wh.duckdb"
     make_warehouse(warehouse)
@@ -44,6 +61,7 @@ def test_stations_upsert_is_idempotent_and_updates(pg_engine, tmp_path):
     assert rows["ST-2"].lat is None and rows["ST-2"].source == "history"
 
 
+# 실시간 수집이 만드는 날짜별 bronze Parquet(date=YYYY-MM-DD/snapshots.parquet)을 직접 쓴다.
 def write_realtime(bronze, day, fetched_at, rows):
     path = bronze / f"date={day:%Y-%m-%d}" / "snapshots.parquet"
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -51,6 +69,11 @@ def write_realtime(bronze, day, fetched_at, rows):
     pq.write_table(pa.Table.from_pylist(records, schema=realtime.SCHEMA), path)
 
 
+# ST-1(과거 이력 대여소)과 ST-9(실시간에만 있는 새 대여소)의 스냅샷을 적재하면 스냅샷 2행·새 대여소
+# 1곳, 같은 파일을 다시 적재하면 (0, 0).
+# ST-1의 이름은 실시간 이름으로 덮어쓰지 않고(history 유지), ST-9는 이름 앞 번호 9와 거치대 수
+# 20으로 source=realtime 추가된다. 마이크로초까지 있는 fetched_at이 그대로 KST(+09:00) 시각으로
+# 읽히고, 세션 시간대가 Asia/Seoul인지도 확인한다(serving/db.py의 연결 설정).
 def test_realtime_load_adds_new_stations_and_skips_duplicates(pg_engine, tmp_path):
     warehouse = tmp_path / "wh.duckdb"
     make_warehouse(warehouse)
@@ -87,6 +110,8 @@ def test_realtime_load_adds_new_stations_and_skips_duplicates(pg_engine, tmp_pat
     assert server_tz == "Asia/Seoul"
 
 
+# 단기예보 두 항목을 두 번 적재하면 처음 2행, 다음 0행. '강수없음' 같은 문자열 값은 그대로 저장되고
+# 예보 시각은 KST 시각이다.
 def test_forecast_load_is_idempotent(pg_engine, tmp_path):
     path = tmp_path / "vilage_fcst.parquet"
     records = [
@@ -104,6 +129,9 @@ def test_forecast_load_is_idempotent(pg_engine, tmp_path):
     assert pcp.fcst_datetime == datetime(2026, 9, 16, 21, tzinfo=KST)
 
 
+# alembic downgrade base로 모든 표가 지워지고(stations 없음), 다시 upgrade head로 만들어지는지 본다.
+# 마이그레이션의 downgrade 경로도 깨지지 않았는지 확인하는 것이다. 접속 문자열의 '%'는 configparser
+# 보간을 피하려고 '%%'로 바꾼다.
 @pytest.mark.parametrize("revision", ["base", "head"])
 def test_migration_round_trip(pg_engine, revision):
     from alembic import command
@@ -122,6 +150,9 @@ def test_migration_round_trip(pg_engine, revision):
             assert conn.execute(text("select to_regclass('stations')")).scalar_one() == "stations"
 
 
+# 실제 서버에서 확인: 마이그레이션이 실패하도록 만든 임시 DB 이름을 기록해 두고, 실패 뒤
+# pg_database에 그 이름이 남아 있지 않은지 관리 연결로 조회한다(실패한 테스트가 임시 DB를 남기지
+# 않음).
 def test_temporary_database_is_dropped_when_migration_fails(pg_engine):
     """pg_engine이 쓰는 임시 DB 도구가 마이그레이션 실패에도 DB를 지우는지(T30)."""
     from conftest import temporary_database

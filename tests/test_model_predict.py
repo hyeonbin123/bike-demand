@@ -1,5 +1,20 @@
+# [무엇을 검증하나] 서비스 예측(model/predict.py)이 학습과 같은 특징을 만들고 예측을 올바르게
+# 저장하는지 확인한다.
+# - 같은 대여소·시간이면 서비스 행(predict.feature_rows)과 학습 행(frames.load_frame)의 특징이 모든
+#   열에서 같다(v1 특징, v2 수준 특징 모두)
+# - 학습에 없던 대여소는 새 코드와 서비스 DB의 정보로 예측한다
+# - predict_and_store: 최신 발표의 예보가 있는 시간만 예측하고, 같은 버전을 다시 돌리면 덮어쓴다.
+#   스냅샷이 오래됐으면 거부한다
+# - 산출물이 오래돼 반기를 다 담지 못하면 수준 특징을 결측으로 둔다(e5dd59b), 달력 특징은 시간마다
+#   한 번만 계산한다(9bde296)
+# [왜 중요한가] 학습과 서비스가 특징을 따로 계산하므로(학습은 DuckDB SQL, 서비스는 파이썬) 둘이
+# 어긋나면 모델이 학습 때 보지 못한 입력을 받는다(training-serving skew). 이 테스트가 그 일치를 직접
+# 비교한다.
+
 from datetime import date, datetime, timedelta, timezone
 
+# lightgbm: 저장 경로를 시험할 작은 모델. artifacts: 학습 기간 산출물(대여소 코드·패턴·반기 수준)을
+# 내보내고 다시 읽기. 서비스 DB 모델은 pg_engine에 테스트 행을 넣는 데 쓴다.
 import lightgbm as lgb
 import numpy as np
 import pytest
@@ -9,9 +24,13 @@ from bike_demand.model import artifacts, frames, predict
 from bike_demand.serving.models import Prediction, RealtimeSnapshot, Station, WeatherForecast
 
 KST = timezone(timedelta(hours=9))
+# small_warehouse의 학습 기간(1/1~1/15). 산출물의 대여소 패턴은 이 기간으로만 계산된다.
 HISTORY = ("2024-01-01", "2024-01-16")
 
 
+# small_warehouse로 산출물을 만들고, 1/16~17 두 날의 학습 행과 같은 대여소·시간의 서비스 행을
+# 만든다. 날씨는 dim_hours 값을 그대로 넣어 날씨 출처 차이를 없앤다. 학습 행을 (대여소 코드, 날짜,
+# 시간) 순으로 맞춘 뒤 결측까지 포함해 모든 값이 같아야 한다.
 def test_serving_features_match_training_features(small_warehouse, tmp_path):
     """같은 대여소·시간이면 학습 행(frames)과 서비스 행(predict)의 특징이 같아야 한다."""
     artifacts.export(small_warehouse, HISTORY, tmp_path)
@@ -40,6 +59,9 @@ def test_serving_features_match_training_features(small_warehouse, tmp_path):
     assert keys[0] == ("ST-1", datetime(2024, 1, 16, tzinfo=KST))
 
 
+# v2 수준 특징도 공개 반기 경계가 있는 날들(2023-05, 2023-08, 2024-07·08, 2025-03)에서 학습 행과
+# 서비스 행이 같은지 본다. SQL(LEVEL_SELECT)과 파이썬(level_features)이 '1개월 지난 반기' 규칙을
+# 같게 구현했는지 확인하는 것이다. 산출물 meta의 특징 목록 순서도 확인한다.
 def test_serving_level_features_match_training(two_year_warehouse, tmp_path):
     """v2 수준 특징도 학습 행과 서비스 행이 같아야 한다(공개 반기 경계가 있는 달들)."""
     history = ("2023-01-01", "2025-01-01")
@@ -63,6 +85,9 @@ def test_serving_level_features_match_training(two_year_warehouse, tmp_path):
         np.testing.assert_allclose(serving, training[order], rtol=1e-5, equal_nan=True)
 
 
+# 학습에 없던 대여소(ST-NEW)는 학습 최대 코드 + 1(학습에 없던 범주), 자치구 코드는 학습 때 번호,
+# 거치대 수는 서비스 DB 값을 쓰고, 대여소 패턴은 결측이다. 측정 전 보충에서 정한 새 대여소 처리와
+# 같다.
 def test_unseen_station_gets_new_code_and_serving_values(small_warehouse, tmp_path):
     artifacts.export(small_warehouse, HISTORY, tmp_path)
     loaded = artifacts.load(tmp_path)
@@ -76,6 +101,8 @@ def test_unseen_station_gets_new_code_and_serving_values(small_warehouse, tmp_pa
     assert row["docks"] == 9 and np.isnan(row["profile_mean"])
 
 
+# 특징 이름만 서비스 모델과 같은, 무작위 자료로 5라운드 학습한 작은 LightGBM. 값의 정확도가 아니라
+# 저장 흐름을 시험하는 용도다.
 def tiny_booster():
     rng = np.random.default_rng(0)
     x = rng.random((400, len(frames.FEATURES)), dtype=np.float32)
@@ -84,6 +111,9 @@ def tiny_booster():
     return lgb.train({"objective": "poisson", "verbose": -1, "num_leaves": 4}, data, 5)
 
 
+# 05시 발표에 09~12시 예보가 있으면 hour_start 08~11시(예보 시각 − 1시간)만 예측하고, 최근 스냅샷의
+# 대여소 2곳(실시간에만 있는 ST-9 포함) × 4시간 = 8행이다. 버전 이름은 '모델 이름-fcst발표시각'.
+# 같은 시각에 다시 돌려도 8행 그대로다(같은 버전은 값을 덮어씀, 행이 늘지 않음).
 def test_predict_and_store_writes_and_overwrites(pg_engine, small_warehouse, tmp_path):
     artifacts.export(small_warehouse, HISTORY, tmp_path)
     loaded = artifacts.load(tmp_path)
@@ -121,6 +151,8 @@ def test_predict_and_store_writes_and_overwrites(pg_engine, small_warehouse, tmp
     assert min(r.hour_start for r in rows) == datetime(2026, 9, 17, 8, tzinfo=KST)
 
 
+# 가장 최근 스냅샷이 6시간 한도보다 오래됐으면(하루 전) 예측하지 않고 RuntimeError. 수집이 멈춘 동안
+# 옛 대여소 목록으로 예측을 계속 쌓지 않게 한다.
 def test_predict_refuses_stale_snapshot(pg_engine, small_warehouse, tmp_path):
     artifacts.export(small_warehouse, HISTORY, tmp_path)
     now = datetime(2026, 9, 17, 8, tzinfo=KST)
@@ -139,6 +171,12 @@ def test_predict_refuses_stale_snapshot(pg_engine, small_warehouse, tmp_path):
         predict.predict_and_store(pg_engine, tiny_booster(), artifacts.load(tmp_path), "v", now)
 
 
+# 회귀 테스트(e5dd59b): 자료 끝이 2026-07-01인 산출물에는 2026 하반기가 0건인 하루(07-01)만 집계돼
+# 있을 수 있다. 2026-09에는 2026 상반기가 공개 반기라 정상 값(평균 4, 비율 2)이지만, 산출물을
+# 갱신하지 않고 2027-02가 되면 공개 반기가 2026 하반기라 그 0을 최근 수준으로 읽으면 안 되고
+# 결측이어야 한다.
+# 자료 끝(history_end)을 기록하지 않던 예전 산출물은 예전처럼 그대로 읽는다(하위 호환). 반기 번호는
+# (연도 × 12 + 월 − 1) // 6.
 def test_stale_artifacts_give_missing_level_features_not_a_partial_half():
     """자료 끝(2026-07-01) 뒤에 걸친 반기는 0건인 하루만 집계돼 있을 수 있다. 산출물을 갱신하지 않고
     그 반기의 공개 시점(2027-02)을 넘겨도 그 값을 최근 수준으로 읽지 않는다(T53)."""
@@ -164,6 +202,7 @@ def test_stale_artifacts_give_missing_level_features_not_a_partial_half():
     assert old_way["station_recent_mean"] == 0.0
 
 
+# 대여소·패턴이 하나도 없는 산출물. 달력 특징만 볼 때 쓴다.
 def empty_artifacts():
     return artifacts.Artifacts(
         stations={}, district_codes={}, profile={}, trend={}, global_trend=None,
@@ -172,9 +211,13 @@ def empty_artifacts():
 
 
 # 2026-09-25(금)은 추석, 09-29(화)는 평일
+# 추석(09-25)과 평일(09-29)의 08·18시, 네 시간.
 CALENDAR_HOURS = [datetime(2026, 9, d, h, tzinfo=KST) for d in (25, 29) for h in (8, 18)]
 
 
+# calendar_features 호출을 세어, 대여소 3곳 × 4시간이어도 시간마다 한 번(4번)만 부르는지 본다.
+# 고치기 전에는 대여소×시간마다 KR 공휴일 달력을 새로 만들어, 대여소 약 2,700곳 × 48시간 예측에서
+# 달력 계산에만 약 31초를 썼다(커밋 9bde296).
 def test_feature_rows_computes_calendar_once_per_hour(monkeypatch):
     """달력 특징은 시간에만 달려 있다. 대여소×시간마다 공휴일 달력을 다시 만들지 않는다."""
     calls = []
@@ -192,6 +235,8 @@ def test_feature_rows_computes_calendar_once_per_hour(monkeypatch):
     assert matrix.shape == (12, len(frames.FEATURES)) and len(keys) == 12
 
 
+# 계산을 한 번으로 줄인 뒤에도 값은 그대로인지: 추석(금요일)은 is_holiday·is_offday가 1, 평일은
+# 0이고, 모든 행이 calendar_features의 결과와 같다.
 def test_feature_rows_keep_holiday_calendar():
     weather = {h: dict.fromkeys(frames.WEATHER_FEATURES, 0.0) for h in CALENDAR_HOURS}
     stations = [{"station_id": f"ST-{i}"} for i in range(3)]

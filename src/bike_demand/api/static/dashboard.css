@@ -1,3 +1,10 @@
+/* [파일 역할] 부족 예측 대시보드(index.html)의 스타일. 빌드 도구 없이 FastAPI가 /static/dashboard.css로 */
+/* 그대로 제공한다. */
+/* [색 변수] 글자·선·바탕·강조색과 부족 구간 세 단계(low, medium, high) 색을 :root 변수로 둔다. 지도 원 */
+/* 색은 Leaflet 옵션이라 dashboard.js에 같은 값이 따로 적혀 있으므로 바꿀 때 함께 바꾼다. */
+/* [글꼴] 한글 글꼴(Pretendard, Noto Sans KR, 맑은 고딕)을 먼저 찾고 없으면 시스템 글꼴을 쓴다. */
+/* font-synthesis: none은 없는 굵기·기울임을 브라우저가 흉내 내지 않게 한다. */
+
 :root {
   --ink: #18332c;
   --muted: #5e6c66;
@@ -12,15 +19,20 @@
   background: var(--paper);
   font-synthesis: none;
 }
+/* 기본 초기화: 테두리·안쪽 여백을 너비에 포함하고, 버튼·선택 상자가 페이지 글꼴을 물려받게 한다. */
 * { box-sizing: border-box; }
 body { margin: 0; }
 a { color: inherit; }
 button, select { font: inherit; }
 button, select, a { -webkit-tap-highlight-color: transparent; }
+/* 접근성: 손가락으로 누르기 쉬운 최소 높이 44px, 키보드 포커스가 잘 보이는 파란 외곽선(마우스 클릭에는 안 */
+/* 보이는 focus-visible), 불러오는 동안 비활성인 버튼·선택 상자는 흐리게 하고 대기 커서. */
 button, select { min-height: 44px; }
 button { cursor: pointer; }
 :focus-visible { outline: 3px solid #216cba; outline-offset: 3px; }
 button:disabled, select:disabled { cursor: wait; opacity: .65; }
+/* 레이아웃: 본문 폭을 최대 1440px, 좌우 여백 40px씩으로 가운데 정렬한다. 아래는 머리글, 소개, 조회 조건 */
+/* 영역. */
 .site-header, main, footer { width: min(1440px, calc(100% - 80px)); margin: 0 auto; }
 .site-header { display: flex; justify-content: space-between; align-items: center; padding: 25px 0; border-bottom: 1px solid var(--line); }
 .brand { display: inline-flex; align-items: center; gap: 10px; font-size: 19px; font-weight: 750; text-decoration: none; letter-spacing: -.5px; }
@@ -46,24 +58,32 @@ h2 { font-size: 16px; margin: 0; letter-spacing: -.4px; }
 .filter-note { margin: 0 0 2px auto; font-size: 12px; line-height: 1.8; color: var(--muted); }
 .field-message { width: 100%; margin: 0; color: var(--high); font-size: 12px; }
 .field-message:empty { display: none; }
+/* 반납 미반영 안내와 조회 상태 줄. 오류일 때 상태 줄을 빨간 계열(high 색)로 바꾼다. */
 .notice { display: flex; align-items: baseline; gap: 9px; margin: 17px 0 0; font-size: 12px; color: #5d562f; line-height: 1.7; }
 .notice > span { font-size: 16px; }
 .notice p { margin: 0; }
 .status-line { min-height: 22px; font-size: 13px; margin: 16px 0 12px; color: var(--muted); }
 .status-line.error { color: var(--high); }
+/* 지도(1.2)와 표(1)를 나란히 두는 2열 격자. minmax(0, ...)는 긴 대여소 이름 같은 내용이 열 폭을 밀어내지 */
+/* 않게 한다. */
 .workspace { display: grid; grid-template-columns: minmax(0, 1.2fr) minmax(0, 1fr); gap: 20px; }
 .panel { border: 1px solid var(--line); background: white; border-radius: 12px; overflow: hidden; }
 .panel-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; height: 62px; padding: 0 20px; }
+/* 지도 높이를 표 스크롤 영역(470px)과 맞춘다. z-index: 0으로 새 쌓임 맥락을 만들어 Leaflet 내부 층(높은 */
+/* z-index)이 건너뛰기 링크나 고정 표 머리 위로 올라오지 않게 한다. */
 #map { height: 470px; background: #e8eee5; z-index: 0; }
 .map-message { margin: 0; padding: 0 15px; font-size: 12px; line-height: 1.7; color: #6f4d25; }
 .map-message:not(:empty) { padding-top: 10px; }
 .map-legend { display: flex; flex-wrap: wrap; gap: 16px; align-items: center; padding: 17px 20px; font-size: 11px; }
 .map-legend > span { display: inline-flex; gap: 6px; align-items: center; }
+/* 범례 점은 부족 구간이 클수록 크게 그려 지도 원(부족 대수가 클수록 반지름이 큼)과 같은 인상을 준다. */
 .legend-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; }
 .low { background: var(--low); }
 .legend-dot.medium { background: var(--medium); width: 11px; height: 11px; }
 .legend-dot.high { background: var(--high); width: 14px; height: 14px; }
 .count-badge { font-size: 12px; background: #e9f0e7; color: var(--green); border-radius: 20px; padding: 5px 9px; white-space: nowrap; }
+/* 표: 영역 안에서만 스크롤하고(overscroll-behavior로 끝에 닿아도 페이지가 따라 스크롤되지 않음), 머리 행은 */
+/* sticky로 위에 고정한다. 숫자는 tabular-nums로 자릿수를 맞춘다. 선택한 대여소 행은 옅은 초록 바탕. */
 .table-scroll { height: 470px; overflow: auto; overscroll-behavior: contain; }
 table { width: 100%; border-collapse: collapse; font-size: 12px; font-variant-numeric: tabular-nums; }
 thead { position: sticky; top: 0; z-index: 1; background: #f1f5ef; }
@@ -72,6 +92,8 @@ th:first-child { text-align: left; padding-left: 20px; width: 52%; }
 td { padding: 12px; text-align: right; border-bottom: 1px solid #edf0eb; }
 td:first-child { text-align: left; padding-left: 20px; }
 tr.selected { background: #f1f6ee; }
+/* 대여소 이름은 키보드로 고를 수 있게 button으로 만들고, 겉모양은 글자 링크처럼 보이게 한다. 부족 대수는 */
+/* 구간별 색 칩으로 보인다. */
 .station-button { text-align: left; color: var(--ink); display: block; max-width: 100%; border: none; background: none; padding: 0; font-weight: 650; line-height: 1.55; }
 .station-button:hover { color: var(--green); text-decoration: underline; }
 .station-meta { display: block; color: var(--muted); font-size: 11px; line-height: 1.6; }
@@ -81,6 +103,8 @@ tr.selected { background: #f1f6ee; }
 .shortfall.high { color: #a32936; background: #fcebee; }
 .empty-message { padding: 55px 25px; color: var(--muted); text-align: center; font-size: 13px; line-height: 1.9; }
 .table-footnote { margin: 0; padding: 18px 20px; font-size: 11px; color: var(--muted); }
+/* 대여소 상세: 6시간 막대를 6열 격자로 그린다. 예측이 없는 시간은 빗금(bar-missing)으로 0과 구분한다. 막대 */
+/* 높이는 JS가 최대값 대비 백분율로 넣는다. */
 .detail-panel { margin-top: 20px; padding: 24px; }
 .detail-header { display: flex; justify-content: space-between; gap: 20px; align-items: center; }
 .detail-header h2 { font-size: 21px; overflow-wrap: anywhere; }
@@ -94,16 +118,22 @@ tr.selected { background: #f1f6ee; }
 .bar-value { font-weight: 700; font-variant-numeric: tabular-nums; }
 .bar-hour { color: var(--muted); font-size: 11px; }
 .detail-note { color: var(--muted); font-size: 11px; line-height: 1.8; margin: 18px 0 0; }
+/* 예측 버전·조회 시각 같은 부가 정보는 작게, 긴 버전 문자열은 어디서든 줄바꿈되게 한다. 비어 있으면 */
+/* 숨긴다. */
 .version { color: var(--muted); font-size: 10px; line-height: 1.7; overflow-wrap: anywhere; }
 .version:empty { display: none; }
 #risk-version { margin-top: 14px; }
 footer { border-top: 1px solid var(--line); padding: 23px 0 30px; margin-top: 32px; color: var(--muted); font-size: 11px; line-height: 1.8; }
 footer span { margin: 0 8px; }
+/* 접근성 도구: 건너뛰기 링크는 화면 위쪽 밖에 두었다가 포커스 때만 내려오고, sr-only는 눈에는 안 보이고 */
+/* 화면 낭독기에는 읽히는 표 설명(caption)에 쓴다. */
 .skip-link { position: absolute; left: 20px; top: -80px; z-index: 10000; padding: 12px; background: white; }
 .skip-link:focus { top: 12px; }
 .sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
 .noscript { padding: 20px; background: #fff0df; text-align: center; }
+/* hidden 속성이 위의 display 규칙보다 항상 이기게 한다. JS가 hidden으로 안내 문구를 숨기고 보인다. */
 [hidden] { display: none !important; }
+/* 반응형 1단계(태블릿 폭): 지도와 표를 한 열로 쌓고, 표는 내용 높이만큼(최대 420px) 보인다. */
 @media (max-width: 1000px) {
   .site-header, main, footer { width: calc(100% - 40px); }
   .intro { align-items: start; }
@@ -112,6 +142,8 @@ footer span { margin: 0 8px; }
   #map { height: 400px; }
   .table-scroll { height: auto; max-height: 420px; }
 }
+/* 반응형 2단계(휴대폰 폭): 여백·글자 크기를 줄이고, 소개와 수집 시각을 위아래로, 조회 조건을 한 줄에 맞게 */
+/* 늘린다. 지도·막대 높이도 줄인다. */
 @media (max-width: 600px) {
   .site-header, main, footer { width: calc(100% - 28px); }
   .site-header { padding: 18px 0; }

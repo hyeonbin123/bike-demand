@@ -10,6 +10,17 @@
   관측은 `--fetch-observed`로 한 번 받아 work/ 아래 JSON으로 두고 bronze는 건드리지 않는다.
 """
 
+# [파일 역할] v4 측정(docs/experiments.md v4) 코드. 학습은 관측 날씨, 서비스는 단기예보를 쓰는
+# 차이를 두 가지로 잰다: (1) 같은 시각의 예보 값과 관측 값의 오차(예보 간격별), (2) 같은
+# 발표·대여소·시각을 예보 날씨와 관측 날씨로 각각 예측했을 때 예측이 얼마나 달라지는가.
+# [왜 이렇게] 서비스 기간의 실제 대여 수는 2027년 초에나 공개되므로 정확도 손실은 지금 잴 수 없다.
+# 그래서 판정 규칙 없이 날씨 오차와 예측 민감도만 보고한다. 결과(기온 MAE 0.73~1.08℃, 시간당 예측
+# 평균 절대 차이 0.068대, 예측 평균 비율 1.009, 상위 50곳 겹침 평균 99%)는 README와
+# docs/experiments.md v4 결과 절에 있다.
+# [설계] 계산은 DB·API 없는 순수 함수로 나누고(tests/test_model_forecast_gap.py가 합성 자료로 확인),
+# 실행부만 서비스 DB·서비스 모델·관측 JSON을 읽는다. 특징 생성은 서비스와 같은 predict.feature_rows,
+# 3시간 합은 API와 같은 shortage.expected_rentals를 써서 측정과 서비스의 정의가 같다.
+
 from __future__ import annotations
 
 import math
@@ -18,8 +29,11 @@ from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
+# numpy: 예측 배열 비교와 평균 계산.
 import numpy as np
 
+# API의 부족 계산 함수, 서비스 산출물 타입, 날씨 특징 이름, 서비스 예측의 특징 생성 함수를 그대로
+# 가져온다(측정이 서비스와 같은 계산을 하게).
 from bike_demand.api.shortage import expected_rentals, hours_overlapping
 from bike_demand.model.artifacts import Artifacts
 from bike_demand.model.frames import WEATHER_FEATURES
@@ -29,16 +43,23 @@ KST = timezone(timedelta(hours=9))
 HOUR = timedelta(hours=1)
 # (가장 짧은 간격, 가장 긴 간격, 이름). 간격 = 예보 대상 시각(hour_start + 1시간) - 발표 시각
 LEAD_BUCKETS = ((1, 6, "1-6h"), (7, 24, "7-24h"), (25, 48, "25-48h"))
+# CONTINUOUS: MAE와 평균 차이(예보 - 관측)로 비교할 연속 날씨 값. MIN_RAIN_HOURS: 비 온 고유 관측
+# 시간이 이보다 적으면 강수 지표를 참고용으로만 적는다(계획의 한계 절).
 CONTINUOUS = ("temp_c", "humidity_pct", "wind_ms")
 MIN_RAIN_HOURS = 10  # 계획: 비 온 관측 시간이 이보다 적으면 강수 지표는 참고로만
 
 
+# ASOS 값 문자열을 float로. 빈 값은 NaN.
 def _float(value: str | None) -> float:
     if value is None or str(value).strip() == "":
         return math.nan
     return float(value)
 
 
+# 왜 SQL을 파이썬으로 다시 쓰나: 측정 기간(2026-09)의 관측은 끝나지 않은 달이라 bronze·warehouse에
+# 없고 측정용으로만 따로 받는다(docs/experiments.md v4 기간과 자료). 그래서 dbt stg_weather_hourly
+# 규칙을 그대로 옮겼고, 테스트가 같은 입력에 그 SQL을 직접 돌려 결과가 같은지 확인한다.
+# 호출 위치: 아래 실행부, tests/test_model_forecast_gap.py.
 def observed_hourly(items: Iterable[dict]) -> dict[datetime, dict[str, float]]:
     """ASOS 시간자료 항목 → {hour_start: 날씨 특징}. dbt `stg_weather_hourly`와 같은 규칙.
 
@@ -58,6 +79,8 @@ def observed_hourly(items: Iterable[dict]) -> dict[datetime, dict[str, float]]:
             "new_snow_3h_cm": 0.0 if math.isnan(snow) else snow,
         }
     out = {}
+    # SQL의 three_hour_at과 같은 계산: 이 시각을 덮는 3시간 보고 시각(t 이후 가장 가까운 3의 배수
+    # 시). 겨울(11~3월) 강수는 그 보고값의 1/3, 신적설은 그 보고값 > 0이면 1.
     for observed_at, obs in observations.items():
         three_hour_at = observed_at + ((3 - observed_at.hour % 3) % 3) * HOUR
         covering = observations.get(three_hour_at)
@@ -76,6 +99,8 @@ def observed_hourly(items: Iterable[dict]) -> dict[datetime, dict[str, float]]:
     return out
 
 
+# 예보 간격 = (hour_start + 1시간) - 명목 발표 시각(시간 단위). 1~6, 7~24, 25~48시간 구간 이름을
+# 돌려주고, 범위 밖이면 None(비교에서 뺌).
 def lead_bucket(hour_start: datetime, base: datetime) -> str | None:
     lead = (hour_start + HOUR - base) / HOUR
     for low, high, name in LEAD_BUCKETS:
@@ -89,24 +114,31 @@ def lead_bucket(hour_start: datetime, base: datetime) -> str | None:
 SERVICE_DELAY = timedelta(minutes=15)
 STATION_MAX_AGE = timedelta(hours=6)
 LIST_MAX_AGE = timedelta(minutes=30)
+# GROUPS: 결과 무리(전체, 비 옴, 비 안 옴, 관측 없음). MISSING_WEATHER: 관측 행이 없는 시각에 넣을
+# 날씨(다섯 특징 모두 결측). 학습 격자에서 날씨가 비는 시간과 같은 처리다(docs/experiments.md v4
+# 측정 전 보충).
 GROUPS = ("all", "wet", "dry", "unknown")
 MISSING_WEATHER = dict.fromkeys(WEATHER_FEATURES, math.nan)
 
 
+# 기준 시각 as_of = 발표 + 15분(서비스 예측 작업이 그 발표로 예측을 만드는 시각).
 def issue_as_of(base: datetime) -> datetime:
     return base + SERVICE_DELAY
 
 
+# 관측을 어디까지 받아야 하는지: 마지막 발표 + 48시간이 든 날짜.
 def observed_end(last_issue: datetime) -> date:
     """마지막 발표의 가장 긴 간격(48시간) 예보가 가리키는 관측 시각의 날짜."""
     return (last_issue + 48 * HOUR).astimezone(KST).date()
 
 
+# ASOS API는 전날까지만 주므로 끝 날짜가 오늘 이후면 받지 않고 멈춘다(덜 찬 관측으로 재지 않게).
 def check_fetchable(end: date, today: date) -> None:
     if end >= today:
         raise SystemExit(f"관측은 전날까지만 제공됨: {end} 다음 날 이후에 받는다")
 
 
+# (시각, 예보, 관측) 쌍에서 한 특징이 양쪽 모두 값이 있는 것만 (시각, 예보값, 관측값)으로 뽑는다.
 def _both(pairs, name):
     return [
         (h, f[name], o[name])
@@ -115,10 +147,13 @@ def _both(pairs, name):
     ]
 
 
+# 분모가 0이면 None(표에서 '—').
 def _share(numerator: int, denominator: int) -> float | None:
     return numerator / denominator if denominator else None
 
 
+# 비·눈 같은 '있음/없음' 비교: 일치율(둘 다 같은 판정), 재현율(관측 있음 중 예보도 있음),
+# 정밀도(예보 있음 중 관측도 있음).
 def _events(pairs, name: str) -> dict:
     """0보다 크면 '있음'. 쌍 수와 고유한 관측 시각 수를 함께 적는다(같은 시각은 발표마다 한 쌍)."""
     both = _both(pairs, name)
@@ -136,6 +171,9 @@ def _events(pairs, name: str) -> dict:
     }
 
 
+# 한 예보 간격 구간의 요약: 쌍 수와 고유 시각 수, 연속 값의 MAE·평균 차이, 강수 일치 지표와 비 온
+# 시간의 강수량 MAE, 참고용 여부(고유 시각 수로 판단해 같은 비를 여러 발표가 부풀리지 못하게), 눈을
+# 잴 수 있는지.
 def _summarize(pairs: list[tuple[datetime, dict, dict]]) -> dict:
     summary: dict = {"pairs": len(pairs), "unique_hours": len({h for h, _, _ in pairs})}
     for name in CONTINUOUS:
@@ -156,6 +194,7 @@ def _summarize(pairs: list[tuple[datetime, dict, dict]]) -> dict:
     return summary
 
 
+# 호출 위치: 아래 실행부, tests/test_model_forecast_gap.py.
 def weather_errors(
     issues: Iterable[tuple[datetime, dict[datetime, dict[str, float]]]],
     observed: dict[datetime, dict[str, float]],
@@ -175,6 +214,8 @@ def weather_errors(
     return {name: _summarize(values) for name, values in pairs.items()}
 
 
+# 시간 단위 지표는 그 한 시각으로, 3시간 합과 목록 겹침은 [as_of, as_of+3시간)과 겹치는 시각들로
+# 부른다(docs/experiments.md v4 비 옴 구분).
 def rain_state(observed: dict[datetime, dict[str, float]], hours: Iterable[datetime]) -> str:
     """관측 기준 비 옴 구분: 하나라도 비 → wet, 아니면 하나라도 관측 없음 → unknown, 그 밖 dry."""
     missing = False
@@ -187,6 +228,8 @@ def rain_state(observed: dict[datetime, dict[str, float]], hours: Iterable[datet
     return "unknown" if missing else "dry"
 
 
+# 가상 민감도 비교의 핵심. 예측 함수는 인자로 받아(실행부는 booster.predict) 테스트가 가짜 모델을
+# 넣을 수 있게 한다.
 def predict_both(
     predict: Callable[[np.ndarray], Any],
     stations: list[dict],
@@ -204,6 +247,8 @@ def predict_both(
     observed_weather = {h: observed.get(h, MISSING_WEATHER) for h in hours}
     by_forecast, keys = feature_rows(stations, hours, forecast, artifacts, features)
     by_observed, _ = feature_rows(stations, hours, observed_weather, artifacts, features)
+    # 안전 확인: 날씨 열을 뺀 나머지 특징(달력·대여소·패턴·수준)이 두 행렬에서 정확히 같아야 차이가
+    # 날씨에서만 나온다고 말할 수 있다. NaN끼리도 같은 것으로 본다.
     others = [i for i, name in enumerate(features) if name not in WEATHER_FEATURES]
     if not np.array_equal(by_forecast[:, others], by_observed[:, others], equal_nan=True):
         raise AssertionError("날씨 외 특징이 두 예측에서 다름")
@@ -212,10 +257,13 @@ def predict_both(
     return keys, np.asarray(predict(by_forecast)), np.asarray(predict(by_observed))
 
 
+# 무리별 0으로 시작하는 합계 사전.
 def _zeros(kind=float):
     return dict.fromkeys(GROUPS, kind())
 
 
+# 발표마다 행별 값을 남기지 않고 무리별 합과 개수만 더해 두었다가 report에서 평균·비율을 낸다(44개
+# 발표 × 수만 행).
 @dataclass
 class ShiftTotals:
     """여러 발표에 걸친 예측 흔들림 합계. 무리(all·wet·dry·unknown)는 관측 강수 기준(보충 T49)."""
@@ -236,11 +284,14 @@ class ShiftTotals:
         self, keys, by_forecast, by_observed, observed, as_of, bike_counts, top_n=50, horizon=3
     ):
         """bike_counts=None이면(30분 안 스냅샷 없음) 부족 목록 비교만 뺀다."""
+        # 이 발표의 3시간 구간 무리. 발표 수·3시간 합·목록 겹침은 전체와 이 무리에 함께 센다.
         window = rain_state(observed, hours_overlapping(as_of, horizon))
         for group in ("all", window):
             self.issues[group] += 1
         hourly_f: dict[str, dict[datetime, float]] = {}
         hourly_o: dict[str, dict[datetime, float]] = {}
+        # 시간 단위: 행마다 절대 차이와 양쪽 합을 전체와 그 시각의 무리에 더하고, 대여소별 시간 예측
+        # 사전을 만든다.
         for (station_id, hour_start), f, o in zip(keys, by_forecast, by_observed, strict=True):
             f, o = float(f), float(o)
             for group in ("all", rain_state(observed, [hour_start])):
@@ -250,6 +301,8 @@ class ShiftTotals:
                 self.observed_sum[group] += o
             hourly_f.setdefault(station_id, {})[hour_start] = f
             hourly_o.setdefault(station_id, {})[hour_start] = o
+        # 3시간 합: API와 같은 비율 계산으로 대여소마다 예보·관측 쪽 앞으로 3시간 예상 대여를
+        # 구한다. 필요한 시간이 빠진 대여소는 뺀다.
         expected_f, expected_o = {}, {}
         for station_id in hourly_f:
             ef = expected_rentals(as_of, horizon, hourly_f[station_id])
@@ -260,6 +313,9 @@ class ShiftTotals:
             for group in ("all", window):
                 self.abs_diff_3h[group] += abs(ef - eo)
                 self.stations_3h[group] += 1
+        # 부족 목록 비교는 30분 안 스냅샷이 있을 때만. 겹침 = |예보 목록 ∩ 관측 목록| ÷ |예보
+        # 목록|이고, 예보 목록이 비면 그 발표는 겹침 평균에서 빼고 수만 센다(docs/experiments.md v4
+        # 측정 전 보충).
         if bike_counts is None:
             self.lists_skipped["no_recent_snapshot"] += 1
             return
@@ -272,6 +328,8 @@ class ShiftTotals:
         for group in ("all", window):
             self.overlaps[group].append(overlap)
 
+    # 무리별 결과: 행 수, 시간당 평균 절대 차이, 예측 평균 비율(예보 합 ÷ 관측 합), 발표 수, 3시간
+    # 합 평균 절대 차이, 상위 50곳 겹침(발표 수·평균·최소), 그리고 목록을 건너뛴 이유별 수.
     def report(self) -> dict:
         def ratio(numerator, denominator):
             return numerator / denominator if denominator else None
@@ -296,6 +354,7 @@ class ShiftTotals:
         } | {"lists_skipped": dict(self.lists_skipped)}
 
 
+# 부족 대수 상위 n곳의 대여소ID. 호출 위치: ShiftTotals.add, tests/test_model_forecast_gap.py.
 def top_shortage(bike_counts: dict[str, int], expected: dict[str, float], n: int) -> list[str]:
     """`/shortage-risk`와 같은 순서: 부족 대수(예상 대여 - 자전거 수) > 0, 큰 순, 같으면 ID순."""
     rows = [
@@ -323,6 +382,8 @@ if __name__ == "__main__":
     from bike_demand.serving.db import make_engine
     from bike_demand.serving.models import RealtimeSnapshot, Station, WeatherForecast
 
+    # 기본 발표 범위는 계획한 2026-09-17 02시 ~ 09-23 23시 발표. --fetch-observed는 관측을 한 번
+    # 받아 JSON으로 저장하고, 이후 실행은 그 파일을 다시 쓴다(API를 다시 부르지 않음).
     parser = argparse.ArgumentParser(description="v4(T12) 예보 vs 관측 날씨 측정")
     parser.add_argument("--first-issue", default="2026-09-17T02:00")
     parser.add_argument("--last-issue", default="2026-09-23T23:00")
@@ -334,6 +395,8 @@ if __name__ == "__main__":
 
     first = datetime.fromisoformat(args.first_issue).replace(tzinfo=KST)
     last = datetime.fromisoformat(args.last_issue).replace(tzinfo=KST)
+    # 관측 받기: 첫 발표 날짜 ~ 마지막 발표 + 48시간의 날짜. 아직 제공되지 않은 날짜가 있으면
+    # 멈춘다. bronze가 아니라 --observed 경로에만 저장한다.
     if args.fetch_observed:
         load_dotenv()
         key = os.environ.get("DATA_GO_KR_SERVICE_KEY")
@@ -348,11 +411,14 @@ if __name__ == "__main__":
         print("observed items", len(items))
     observed = observed_hourly(json.loads(args.observed.read_text(encoding="utf-8")))
 
+    # 측정은 CURRENT 서비스 세대 하나로 한다(결과에 세대 이름을 적음). 특징 순서는 모델 자신의
+    # feature_name()을 따른다.
     engine = make_engine()
     generation, booster, artifacts = load_serving_model(args.models)
     features = booster.feature_name()
     issues, skipped = [], {"no_stations": []}
     totals = ShiftTotals()
+    # 예보는 서울 격자(60·127) 행만 쓴다.
     grid = (WeatherForecast.nx == 60) & (WeatherForecast.ny == 127)
     with engine.connect() as conn:
         bases = (
@@ -373,6 +439,8 @@ if __name__ == "__main__":
             ).all()
             forecast = hourly_weather((r[0], r[1], r[2]) for r in rows)
             issues.append((base, forecast))
+            # 발표마다: as_of 이전 6시간 안의 가장 최근 스냅샷 하나의 대여소 집합을 쓴다(서비스 예측
+            # 작업과 같은 한도). 그런 스냅샷이 없으면 그 발표는 예측 비교에서 빼고 기록한다.
             as_of = issue_as_of(base).astimezone(KST)
             snapshot_at = conn.execute(
                 select(RealtimeSnapshot.fetched_at)
@@ -391,6 +459,8 @@ if __name__ == "__main__":
                 .order_by(Station.station_id)
             ).mappings().all()  # fmt: skip
             stations = [dict(r) for r in snapshot]
+            # as_of가 든 시간부터 48시간 중 예보가 있는 시각을 두 날씨로 예측하고, 부족 목록은 그
+            # 스냅샷이 as_of 30분 안일 때만 그 자전거 수로 만든다.
             first_hour = as_of.replace(minute=0, second=0, microsecond=0)
             hours = [first_hour + i * HOUR for i in range(48)]
             keys, by_f, by_o = predict_both(
@@ -403,6 +473,7 @@ if __name__ == "__main__":
                 base.astimezone(KST).isoformat(), len(keys), "list" if recent else "-", flush=True
             )
 
+    # 계획한 발표 수(3시간 간격)와 실제로 DB에서 찾은 수를 함께 적어 빠진 발표를 드러낸다.
     expected_issues = int((last - first) / timedelta(hours=3)) + 1
     report = {
         "generation": generation,

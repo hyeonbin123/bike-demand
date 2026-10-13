@@ -8,6 +8,16 @@
   다음 정상 실행이 회수한다(T35, T39).
 """
 
+# [파일 역할] Airflow DAG의 BashOperator가 `python -m bike_demand.pipelines <명령>`으로 부르는
+# 진입점이다. 여러 단계를 한 프로세스 안에서 묶어 실행해야 순서·날짜가 어긋나지 않는 작업만 여기에
+# 둔다.
+# [왜 묶나] 수집·Parquet 변환·DB 적재를 Airflow 작업 셋으로 나누면 각 작업이 '오늘 날짜'를 따로
+# 계산해 자정 무렵 날짜가 달라질 수 있다(모듈 docstring). 한 함수 안에서 수집 시각 하나로 날짜를
+# 정하면 이 틈이 없어진다.
+# [연결] collect-realtime은 airflow/dags/collect_realtime.py가 10분마다, latest-trip-month는
+# airflow/dags/refresh_history.py가 날씨 수집 범위와 dbt calendar_end를 정할 때 부른다. 실제
+# 수집·변환은 ingest/realtime.py, 적재는 serving/load.py가 한다.
+
 from __future__ import annotations
 
 import calendar
@@ -19,13 +29,19 @@ from contextlib import contextmanager
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
+# httpx: 실시간 API 호출용 클라이언트를 테스트에서 가짜로 넣을 수 있게 타입으로 받는다. Engine:
+# 서비스 DB(PostgreSQL) 연결.
 import httpx
 from sqlalchemy import Engine
 
+# realtime: 따릉이 실시간 대여정보 다운로드·날짜별 Parquet 변환. trips: 대여이력 원본 목록(가장 최근
+# 달 찾기). load: Parquet을 서비스 DB에 적재.
 from bike_demand.ingest import realtime, trips
 from bike_demand.serving import load
 
 
+# 대여이력 원본 폴더(CSV·ZIP)에서 가장 최근 달을 'YYYY-MM'으로 돌려준다. trips.discover_sources가 달
+# 순으로 정렬해 주므로 마지막 항목이 최신이다. 원본이 하나도 없으면 SystemExit로 멈춘다.
 def latest_trip_month(raw_dir: Path) -> str:
     sources = trips.discover_sources(raw_dir)
     if not sources:
@@ -33,6 +49,8 @@ def latest_trip_month(raw_dir: Path) -> str:
     return sources[-1].month
 
 
+# 'YYYY-MM'을 그달 말일 'YYYY-MM-DD'로 바꾼다(윤년 2월 포함, calendar.monthrange). dbt의
+# calendar_end var에 넘기는 값이다.
 def last_day(month: str) -> str:
     year, mon = map(int, month.split("-"))
     return f"{month}-{calendar.monthrange(year, mon)[1]:02d}"
@@ -54,10 +72,19 @@ LOCK_NAME = ".collect-realtime.lock"
 STALE_LOCK_SECONDS = 30 * 60
 
 
+# 잠금을 얻지 못했을 때 내는 예외. 원본 수집은 이미 끝난 뒤라 이번 스냅샷은 잃지 않고, 적재는
+# Airflow 재시도나 다음 실행의 회수 단계가 맡는다.
 class LoadBusy(RuntimeError):
     """다른 실행이 적재 중이다. Airflow 재시도나 다음 실행이 이어받는다."""
 
 
+# bronze 폴더에 잠금 파일을 만들어 한 번에 한 실행만 재생성·적재·기록 구간에 들어가게 한다.
+# - O_CREAT | O_EXCL: 파일이 없을 때만 원자적으로 만든다. 이미 있으면 다른 실행이 들어가 있는 것이라
+#   LoadBusy.
+# - STALE_LOCK_SECONDS보다 오래된 잠금은 중단된 실행(컨테이너 종료 등)이 남긴 것으로 보고 지운다.
+#   이렇게 하지 않으면 잠금 하나가 남아 수집이 영원히 막힌다.
+# - 잠금에 무작위 토큰을 적고, 끝날 때 토큰이 자기 것일 때만 지운다. 오래 걸려 잠금을 빼앗긴 실행이
+#   끝나면서 새 주인의 잠금을 지우는 일을 막는다.
 @contextmanager
 def _load_lock(bronze_dir: Path) -> Iterator[None]:
     """잠금에 자기 표식을 적고, 풀 때는 표식이 그대로일 때만 지운다(가져간 실행의 잠금 보존)."""
@@ -85,19 +112,24 @@ def _load_lock(bronze_dir: Path) -> Iterator[None]:
             pass
 
 
+# 그날 원본 폴더(date=YYYY-MM-DD)의 JSON 파일 이름 목록(정렬). loaded.txt와 비교하는 기준이다.
 def _raw_names(raw_dir: Path, day: date) -> list[str]:
     return sorted(path.name for path in (raw_dir / f"date={day:%Y-%m-%d}").glob("*.json"))
 
 
+# 그날 bronze 폴더 안의 loaded.txt 경로.
 def _marker(bronze_dir: Path, day: date) -> Path:
     return bronze_dir / f"date={day:%Y-%m-%d}" / LOADED_MARKER
 
 
+# loaded.txt에 적힌 원본 이름 목록. 파일이 없으면 None(한 번도 적재에 성공하지 않은 날).
 def _loaded_names(bronze_dir: Path, day: date) -> list[str] | None:
     path = _marker(bronze_dir, day)
     return path.read_text(encoding="utf-8").split() if path.exists() else None
 
 
+# 적재에 성공한 원본 이름을 loaded.txt에 쓴다. 임시 파일에 다 쓴 뒤 os.replace로 바꿔 끼워, 쓰다
+# 중단돼도 반쯤 쓴 기록이 남지 않게 한다(원자적 교체). 줄 끝은 LF로 고정한다.
 def _mark_loaded(bronze_dir: Path, day: date, names: list[str]) -> None:
     path = _marker(bronze_dir, day)
     tmp = path.with_name(f"{LOADED_MARKER}.{uuid.uuid4().hex}.tmp")
@@ -105,6 +137,12 @@ def _mark_loaded(bronze_dir: Path, day: date, names: list[str]) -> None:
     os.replace(tmp, path)
 
 
+# collect-realtime 명령의 본체. 한 번 수집하고, 오늘과 덜 적재된 최근 날들의 Parquet을 다시 만들어
+# 서비스 DB에 적재한 뒤 결과 요약 사전을 돌려준다.
+# now와 client는 테스트에서 시각과 HTTP 응답을 고정하려고 받는다(운영에서는 None).
+# 주의: 실행마다 그날 원본 전체로 Parquet을 다시 만들고 적재를 시도한다(이미 있는 행은 적재 단계가
+# 건너뜀). 덜 적재된 지난 날을 오늘보다 먼저 처리하므로, 지난 날 하나가 계속 실패하면 오늘 적재도 그
+# 실행에서는 진행되지 않는다.
 def collect_realtime(
     engine: Engine,
     raw_dir: Path,
@@ -124,18 +162,28 @@ def collect_realtime(
     `serving.load realtime --day`로 직접 적재한다. 이 수동 적재는 이미 있는 행을 건너뛸 뿐
     loaded.txt를 쓰지 않으므로 수집 작업과 겹쳐도 기록이 어긋나지 않는다.
     """
+    # 수집 시각을 KST로 고정하고 그 날짜를 '오늘'로 삼는다. 이후 모든 단계가 이 날짜 하나를 쓴다.
     collected_at = realtime._kst(now or datetime.now(realtime.KST))
     day = collected_at.date()
+    # 원본 JSON은 잠금 밖에서 먼저 저장한다. 다른 실행이 적재 중이어도 이번 스냅샷 원본은 남아
+    # 나중에 회수된다.
     path, status = realtime.download(raw_dir, service_key, collected_at, client=client)
     result: dict = {"day": day.isoformat(), "raw": str(path), "status": status, "days": {}}
     with _load_lock(bronze_dir):
+        # 회수 대상: 최근 7일(오래된 날부터) 중 원본이 있고, 원본 목록이 loaded.txt 기록과 다른 날.
+        # 원본이 없는 날([])과 기록이 원본과 같은 날은 건너뛴다.
         past = [day - timedelta(days=n) for n in range(RECOVER_DAYS, 0, -1)]
         pending = [
             d for d in past if _raw_names(raw_dir, d) not in ([], _loaded_names(bronze_dir, d))
         ]
+        # names는 Parquet을 만들기 전에 읽는다. 그 뒤에 새 원본이 생겨도 Parquet에는 들어가고
+        # 기록에는 빠질 뿐이라, 기록이 실제 적재보다 앞서는 일은 없다(LOCK_NAME 위 주석).
         for target in [*pending, day]:
             names = _raw_names(raw_dir, target)
             parquet = bronze_dir / f"date={target:%Y-%m-%d}" / "snapshots.parquet"
+            # 실행마다 자기 이름(uuid)의 임시 Parquet을 만들어 그 파일을 적재한다. 다른 실행이 같은
+            # 날의 snapshots.parquet을 바꿔 끼워도 이 실행이 적재하는 내용은 바뀌지 않는다. 적재에
+            # 성공한 뒤에야 정식 이름으로 교체하고, 실패하면 임시 파일만 지워진다.
             own = parquet.with_name(f"snapshots.{uuid.uuid4().hex}.parquet.part")
             try:
                 rows = realtime.to_parquet(raw_dir, own, target)
@@ -143,12 +191,16 @@ def collect_realtime(
                 os.replace(own, parquet)
             finally:
                 own.unlink(missing_ok=True)
+            # 적재가 예외 없이 끝난 날만 기록한다. 실패한 날은 기록이 원본과 달라 다음 실행이 다시
+            # 회수한다.
             _mark_loaded(bronze_dir, target, names)
             result["days"][target.isoformat()] = {
                 "parquet_rows": rows,
                 "snapshots_inserted": snapshots,
                 "new_stations": stations,
             }
+    # 요약: Parquet 행 수는 오늘 것, 넣은 스냅샷·새 대여소 수는 회수한 날까지 합친 값. Airflow
+    # 로그에 이 사전이 찍힌다.
     today = result["days"][day.isoformat()]
     result.update(
         parquet_rows=today["parquet_rows"],
@@ -158,6 +210,9 @@ def collect_realtime(
     return result
 
 
+# 명령줄: `python -m bike_demand.pipelines collect-realtime [--raw --bronze]` 또는
+# `latest-trip-month [--raw] [--last-day]`. latest-trip-month는 결과를 표준 출력으로만 내고 끝나므로
+# 인증키나 DB 없이 돈다(refresh_history DAG가 셸 $(...)로 그 출력을 받아 쓴다).
 if __name__ == "__main__":
     import argparse
 
@@ -180,10 +235,12 @@ if __name__ == "__main__":
         print(last_day(month) if args.last_day else month)
         raise SystemExit(0)
 
+    # 서울 열린데이터광장 인증키는 .env에서 읽는다. 키는 코드에 두지 않는다.
     load_dotenv()
     key = os.environ.get("SEOUL_OPEN_API_KEY")
     if not key:
         raise SystemExit(".env에 SEOUL_OPEN_API_KEY가 없음 (.env.example 참고)")
+    # API 오류는 스택 추적 없이 메시지만 남기고 실패 종료해 Airflow가 작업 실패로 표시하게 한다.
     try:
         print(collect_realtime(make_engine(), args.raw, args.bronze, key))
     except realtime.ApiError as exc:
