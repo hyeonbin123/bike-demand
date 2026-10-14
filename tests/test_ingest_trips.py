@@ -100,7 +100,7 @@ def test_convert_normalizes_columns_and_nulls(tmp_path):
     assert t2025.schema == trips.SCHEMA
     row = t2025.to_pylist()[0]
     assert row["rent_station_no"] == "03812"  # 앞의 0 유지
-    assert row["gender"] is None  # \N -> null
+    assert row["gender"] is None  # 원본의 빈 값 표기 \N은 null
     assert row["bike_type"] == "일반자전거"
     assert row["source_file"].endswith("_2507.csv")
 

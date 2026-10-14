@@ -78,7 +78,8 @@ def export(
 # load가 돌려주는, 예측에 바로 쓰기 좋은 사전 묶음. profile 키는 (대여소, 쉬는 날 여부, 시각).
 @dataclass
 class Artifacts:
-    # station_id -> station_code, district, district_code, docks, lat, lon
+    # 대여소ID(station_id) → 그 대여소의 stations.parquet 한 행을 담은 사전(station_code,
+    # district, district_code, docks, lat, lon)
     stations: dict[str, dict]
     district_codes: dict[str, int]
     profile: dict[tuple[str, bool, int], float]

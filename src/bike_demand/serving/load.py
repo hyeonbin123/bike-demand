@@ -215,7 +215,12 @@ if __name__ == "__main__":
     s = sub.add_parser("stations")
     s.add_argument("--warehouse", type=Path, default=Path("data/warehouse/bike_demand.duckdb"))
     r = sub.add_parser("realtime")
-    r.add_argument("--day", type=date.fromisoformat, required=True, help="YYYY-MM-DD (KST)")
+    r.add_argument(
+        "--day",
+        type=date.fromisoformat,
+        required=True,
+        help="적재할 수집 날짜 YYYY-MM-DD(KST 기준). 그날의 정식 snapshots.parquet을 넣는다",
+    )
     r.add_argument("--bronze", type=Path, default=Path("data/bronze/realtime/bikelist"))
     f = sub.add_parser("forecasts")
     f.add_argument("--parquet", type=Path, default=Path("data/bronze/weather/vilage_fcst.parquet"))

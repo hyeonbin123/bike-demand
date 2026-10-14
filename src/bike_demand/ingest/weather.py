@@ -267,7 +267,7 @@ def download(
 # 이슬점, 기압, 일조, 운량, 시정, 지면온도)는 원본 모양 그대로 보존만 한다.
 # 원본 응답 필드 중 저장할 것. 값은 문자열 그대로 두고(빈 문자열은 null) 해석은 dbt에서 한다.
 FIELDS = {
-    "tm": "observed_at",  # "YYYY-MM-DD HH:MM", KST
+    "tm": "observed_at",  # 관측 시각. "YYYY-MM-DD HH:MM" 형식의 한국 표준시(KST)
     "stnId": "station_id",
     "ta": "temp_c",
     "rn": "rain_mm",  # 비가 안 오면 빈 값

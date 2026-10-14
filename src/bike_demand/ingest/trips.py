@@ -79,7 +79,7 @@ _MONTH_RE = re.compile(r"_(\d{2})(\d{2})\.csv$")
 class TripSource:
     """월 하나의 원본 CSV. ``member``가 있으면 ``path`` ZIP 안의 파일이다."""
 
-    month: str  # "YYYY-MM"
+    month: str  # 원본이 담은 달, "YYYY-MM" 형식(파일 이름 끝 _YYMM에서 뽑음)
     path: Path
     member: str | None = None
     member_label: str | None = None  # 깨진 한글을 되살린 ZIP 안 파일 이름

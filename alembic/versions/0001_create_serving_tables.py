@@ -1,4 +1,4 @@
-"""create serving tables
+"""서비스용 테이블 만들기: stations, realtime_snapshots, weather_forecasts, predictions
 
 Revision ID: 0001
 Revises:

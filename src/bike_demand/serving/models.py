@@ -39,7 +39,8 @@ class Station(Base):
     lat: Mapped[float | None] = mapped_column(Double)
     lon: Mapped[float | None] = mapped_column(Double)
     docks: Mapped[int | None] = mapped_column(Integer)
-    source: Mapped[str] = mapped_column(String(20))  # history | realtime
+    # 출처: 'history'(dbt dim_stations에서 옴) 또는 'realtime'(실시간 스냅샷에만 있는 새 대여소)
+    source: Mapped[str] = mapped_column(String(20))
     # 넣을 때 DB 시각(now())이 기본값으로 들어가고, SQLAlchemy로 UPDATE할 때도 갱신된다. 적재의
     # upsert는 set_에 직접 now()를 넣는다.
     updated_at: Mapped[datetime] = mapped_column(
