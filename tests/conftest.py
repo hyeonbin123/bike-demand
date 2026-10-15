@@ -2,6 +2,7 @@
 
 `docker compose up -d db`로 띄운 서버에 테스트마다 임시 DB를 만들고 마이그레이션을 적용한 뒤 지운다.
 개발 DB(bike_demand)의 데이터는 건드리지 않는다. 서버에 접속할 수 없으면 해당 테스트는 건너뛴다.
+환경 변수 BIKE_DEMAND_REQUIRE_DB=1이면 건너뛰지 않고 실패한다(CI가 이렇게 돈다).
 """
 
 # [파일 역할] pytest가 모든 테스트 파일에 자동으로 주는 공용 fixture 모음. 두 종류다.
@@ -11,12 +12,16 @@
 #   warehouse). 실제 1억 건대 warehouse 없이 특징·수준 계산 SQL을 검증한다.
 # [설계 이유] 개발 DB의 수집 자료를 건드리지 않으려고 같은 서버에 이름이 무작위인 DB를 따로 만들고,
 # 실제 alembic 마이그레이션을 적용해 운영과 같은 스키마로 잰다. DB가 꺼져 있으면 실패 대신 건너뛰어,
-# DB 없는 환경(새 클론 등)에서도 나머지 테스트는 돈다.
+# DB 없는 환경(새 클론 등)에서도 나머지 테스트는 돈다. 다만 DB를 띄워 둔 것이 전제인 곳(CI)에서
+# 건너뛰기는 "DB 테스트가 하나도 돌지 않았는데도 통과"로 보이므로, BIKE_DEMAND_REQUIRE_DB=1이면
+# 같은 상황을 실패로 바꾼다(아래 REQUIRE_DB_ENV).
 
 from __future__ import annotations
 
+import os
 import uuid
 from contextlib import contextmanager
+from typing import NoReturn
 
 # duckdb: 메모리 warehouse fixture. sqlalchemy: 임시 DB를 만들고 지우는 관리용 연결. make_url: 접속
 # 문자열에서 DB 이름만 바꾸기.
@@ -92,22 +97,39 @@ def temporary_database(upgrade=None):
 # 한 번 접속에 실패하면 이번 실행의 나머지 DB 테스트는 제한 시간을 다시 기다리지 않고 바로 건너뛴다
 _db_unavailable: str | None = None
 
+# 이 환경 변수가 정확히 "1"이면 DB에 접속할 수 없을 때 건너뛰지 않고 실패한다.
+# [왜] GitHub Actions는 Postgres 서비스 컨테이너를 붙여 DB 테스트까지 돌리는데, 서비스 이름·포트·
+# DATABASE_URL 중 하나가 틀리면 DB 테스트가 모두 건너뛰어진 채 "통과"로 끝나 회귀를 놓친다.
+# .github/workflows/ci.yml이 이 값을 켠다. 로컬 기본값(꺼짐)은 그대로라 DB 없는 새 클론에서도 나머지
+# 테스트는 돈다. "true"·"yes" 같은 다른 값은 꺼짐으로 본다(값 해석을 하나로 고정).
+REQUIRE_DB_ENV = "BIKE_DEMAND_REQUIRE_DB"
+
+
+# DB에 접속할 수 없을 때의 처리: 기본은 건너뛰기, REQUIRE_DB_ENV=1이면 실패.
+# fixture 안에서 pytest.fail을 부르면 그 테스트는 setup 단계 ERROR로 기록되고 pytest 종료 코드가
+# 0이 아니게 된다. pytrace=False는 fixture 내부 스택 대신 이유 한 줄만 보여 준다.
+def _database_unavailable(reason: str) -> NoReturn:
+    message = f"PostgreSQL에 접속할 수 없음 (docker compose up -d db): {reason}"
+    if os.environ.get(REQUIRE_DB_ENV) == "1":
+        pytest.fail(f"{message} ({REQUIRE_DB_ENV}=1이라 건너뛰지 않음)", pytrace=False)
+    pytest.skip(message)
+
 
 # DB 테스트가 받는 fixture. 테스트마다 빈 임시 DB(스키마만 있음)를 준다. 서버에 접속할 수 없으면
 # 이유(예외 이름)를 기억해 두고, 이번 실행의 나머지 DB 테스트는 다시 5초씩 기다리지 않고 바로
 # 건너뛴다(DB가 꺼진 상태에서 테스트가 오래 멈추던 문제를 고친 것, test_review_regressions.py가
-# 검증).
+# 검증). REQUIRE_DB_ENV=1이면 건너뛰는 대신 실패한다(기억한 뒤의 테스트도 마찬가지).
 @pytest.fixture
 def pg_engine():
     global _db_unavailable
     if _db_unavailable is not None:
-        pytest.skip(f"PostgreSQL에 접속할 수 없음 (docker compose up -d db): {_db_unavailable}")
+        _database_unavailable(_db_unavailable)
     try:
         with temporary_database() as engine:
             yield engine
     except DatabaseUnavailable as exc:
         _db_unavailable = str(exc)
-        pytest.skip(f"PostgreSQL에 접속할 수 없음 (docker compose up -d db): {exc}")
+        _database_unavailable(str(exc))
 
 
 # 특징 SQL을 검증하는 작은 warehouse(2024-01 한 달). dbt의

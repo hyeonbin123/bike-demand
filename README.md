@@ -1,5 +1,7 @@
 # bike-demand
 
+[![CI](https://github.com/hyeonbin123/bike-demand/actions/workflows/ci.yml/badge.svg)](https://github.com/hyeonbin123/bike-demand/actions/workflows/ci.yml)
+
 서울시 공공자전거 따릉이의 과거 대여 기록과 날씨로 **대여소별 시간당 대여 수를 예측**하고, 실시간 대여정보와 합쳐 **곧 자전거가 부족해질 대여소**를 보여 주는 데이터 파이프라인과 예측 서비스.
 
 ![대시보드: 앞으로 3시간 동안 자전거가 부족해질 것으로 예상되는 대여소를 지도와 표로 보여 준다](docs/images/dashboard.png)
@@ -14,10 +16,17 @@
 |---|---|---|
 | 1. 과거 데이터 적재 | 대여이력(반기 공개, 2023-01~2026-06, 1억 4,464만 건) → 월별 Parquet → dbt로 정제 → 대여소별·시간별 대여·반납 수. 같은 달을 다시 넣어도 중복되지 않음 | 완료 |
 | 2. 날씨 결합 | 기상청 ASOS 서울(108) 시간 관측값(기온, 강수, 풍속, 습도, 신적설)을 시간 단위로 결합 | 완료 |
-| 3. 실시간 수집 | 실시간 대여정보(대여소별 현재 자전거 수)를 10분마다, 단기예보를 발표마다 저장 (Airflow) | 동작 중 |
+| 3. 실시간 수집 | 실시간 대여정보(대여소별 현재 자전거 수)를 10분마다, 단기예보를 발표마다 저장 (Airflow) | 완료. 2026-09-16~10-03 중 PC를 켜 둔 동안 수집(스냅샷이 있는 날 9일, 예보 발표 66개), 지금은 멈춤(아래 '현재 상태') |
 | 4. 예측 | LightGBM 하나로 전체 대여소의 시간별 대여 수 예측. 시간 순서로 나눠 검증 | 완료 |
 | 5. 서비스 | 앞으로 N시간 예상 대여가 지금 자전거 수보다 많은 대여소를 FastAPI와 지도 대시보드로 표시 | 완료 |
 | 6. 추가 측정 | 학습은 관측 날씨, 서비스는 예보 날씨를 쓰는 차이 | 완료(2026-09-26). 예보 46개 발표에서 기온 예보 오차 0.7~1.1℃. 관측 날씨로 바꿔 예측하면 시간당 예측의 평균 절대 차이 0.07대, 예보 날씨 쪽 예측 평균이 0.9% 높음, 부족 상위 50곳 겹침 평균 99%. 비 온 시간이 없어 강수는 못 쟀다 |
+
+## 현재 상태
+
+- **프로젝트는 끝났고 수집은 멈춰 있다.** 2026-10-03에 Airflow·DB 컨테이너를 멈춘 뒤로 실시간 대여정보·단기예보 수집과 예측이 돌지 않는다. 아래 '결과'의 측정 값은 그대로다
+- 멈춘 동안의 실시간 스냅샷은 되살릴 수 없다. 지금 API를 띄우면 최근 스냅샷이 없어 `/shortage-risk`는 503(`no recent snapshot`)을 돌려준다
+- **다시 켜려면**: `.env`에 두 인증키를 넣고 `docker compose up -d db` → `docker compose --profile airflow up -d --build`. 컨테이너를 지우지 않았으면 DAG를 켠 상태도 남아 있다. 새로 만들면 DAG가 멈춘 상태로 생기므로 아래 '서비스 DB와 Airflow' 절처럼 `collect_realtime`·`forecast_and_predict`를 켜고, 예측에는 학습한 서비스 모델(`data/models/v1/serving/`)이 있어야 한다. 단기예보는 최근 24시간 안에 빠진 발표만 다시 받는다
+- 코드 검사는 GitHub Actions가 main push와 pull request마다 돌린다: `ruff check`·`ruff format --check`, `dbt parse`, PostgreSQL 서비스 컨테이너를 붙인 `pytest`(원본 데이터·인증키 없이 합성 자료로 돈다)
 
 ## 결과
 
@@ -86,7 +95,7 @@ PYTHONUTF8=1 uv run dbt build --project-dir dbt --profiles-dir dbt
 
 날씨 수집은 `.env.example`을 `.env`로 복사해 공공데이터포털 인증키를 넣은 뒤 `uv run python -m bike_demand.ingest.weather`. 실시간 대여정보는 서울 열린데이터광장 인증키가 필요하다.
 
-테스트: `uv run pytest`(2026-10-13 기준 285개), `uv run ruff check .` (DB 테스트는 `docker compose up -d db`가 떠 있어야 하고, 없으면 건너뜀). 새로 클론한 저장소에서 `uv sync` → `ruff check`·`pytest`(207개)·`dbt parse`·`docker compose config`·`alembic history`가 원본 데이터 없이 통과하는 것을 확인했다(2026-09-17).
+테스트: `uv run pytest`(2026-10-15 기준 288개), `uv run ruff check .`, `uv run ruff format --check .` (DB 테스트는 `docker compose up -d db`가 떠 있어야 하고, 없으면 건너뜀. `BIKE_DEMAND_REQUIRE_DB=1`이면 건너뛰지 않고 실패하며, CI가 이렇게 돈다). 새로 클론한 저장소에서 `uv sync` → `ruff check`·`pytest`(207개)·`dbt parse`·`docker compose config`·`alembic history`가 원본 데이터 없이 통과하는 것을 확인했다(2026-09-17).
 
 ### 측정
 

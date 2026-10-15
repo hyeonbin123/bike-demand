@@ -1,0 +1,79 @@
+# CI: push·pull request마다 린트, dbt 파싱, 전체 테스트(서비스 DB 테스트 포함)를 돌린다.
+# - 원본 대여이력·warehouse·인증키 없이 도는 검사만 넣었다. 테스트는 합성 자료(메모리 DuckDB, 임시
+#   폴더의 합성 bronze로 돌리는 dbt build, httpx 가짜 응답)와 아래 Postgres 서비스의 임시 DB만 쓴다.
+# - 로컬에서 같은 검사를 돌리는 방법은 README '실행' 절의 테스트 줄과 같다(DB는 docker compose의 db).
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# 같은 브랜치에 새 push가 오면 앞선 실행을 취소한다(결과를 볼 일이 없는 실행에 시간을 쓰지 않음).
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    # ubuntu-latest는 가리키는 버전이 바뀌므로(새 Ubuntu로 넘어갈 때 시스템 라이브러리가 달라짐) 고정한다.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+
+    services:
+      # 서비스 DB 테스트용 PostgreSQL. 이미지·사용자·DB 이름·호스트 포트를 docker-compose.yml의 db
+      # 서비스와 같게 두어, 코드 기본 접속 주소(127.0.0.1:55452/bike_demand)와 로컬 절차가 그대로 맞는다.
+      # 테스트는 이 서버에 테스트마다 이름이 무작위인 임시 DB를 만들고 지운다(tests/conftest.py).
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: bike
+          POSTGRES_PASSWORD: bike
+          POSTGRES_DB: bike_demand
+        ports:
+          - 55452:5432
+        options: >-
+          --health-cmd "pg_isready -U bike -d bike_demand"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 20
+
+    env:
+      UV_PYTHON: "3.11"
+      # 이 작업에서만 쓰는 접속 주소(위 서비스 컨테이너, CI 전용 값이며 비밀이 아님).
+      DATABASE_URL: postgresql+psycopg://bike:bike@127.0.0.1:55452/bike_demand
+      # DB에 접속하지 못하면 DB 테스트를 건너뛰지 않고 실패시킨다(tests/conftest.py의 pg_engine).
+      # 이 값이 없으면 서비스 설정이 틀려도 DB 테스트가 모두 건너뛰어진 채 초록으로 끝난다.
+      BIKE_DEMAND_REQUIRE_DB: "1"
+      # dbt 사용 통계 전송을 끈다(CI 실행이 통계에 섞이지 않게).
+      DBT_SEND_ANONYMOUS_USAGE_STATS: "false"
+
+    steps:
+      - uses: actions/checkout@v7
+
+      # setup-uv는 v8부터 v10 같은 주 버전 태그를 내지 않아 정확한 릴리스로 고정한다.
+      - uses: astral-sh/setup-uv@v10.2.0
+        with:
+          enable-cache: true
+
+      # --locked: pyproject.toml과 uv.lock이 어긋나면(잠금 갱신을 빠뜨리면) 설치 단계에서 실패한다.
+      - name: Install dependencies
+        run: uv sync --locked
+
+      - name: Lint
+        run: |
+          uv run --no-sync ruff check .
+          uv run --no-sync ruff format --check .
+
+      # 모델 SQL·테스트·seed 설정이 읽히는지 확인한다. parse는 warehouse에 접속하지 않으므로
+      # data/warehouse가 없어도 된다. 모델 SQL에 한글 주석이 있어 로컬 Windows와 같은 PYTHONUTF8=1을 둔다.
+      - name: dbt parse
+        run: uv run --no-sync dbt parse --project-dir dbt --profiles-dir dbt
+        env:
+          PYTHONUTF8: "1"
+
+      # -rs: 건너뛴 테스트가 있으면 이유를 요약에 보인다(BIKE_DEMAND_REQUIRE_DB=1이라 DB 때문에 건너뛰는
+      # 테스트는 없어야 한다). tests/test_dbt_calendar_end.py가 합성 자료로 dbt build 전체도 돌린다.
+      - name: Test
+        run: uv run --no-sync pytest -q -rs

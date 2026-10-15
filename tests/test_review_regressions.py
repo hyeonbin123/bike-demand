@@ -13,7 +13,8 @@
 # - 서비스 세대: 읽는 도중 CURRENT가 바뀌어도 모델과 산출물을 같은 세대에서 읽음, 게시 실패 시 이전
 #   포인터 유지
 # - 인증키: 유니코드 이스케이프로 숨긴 키도 거부하고 어디에도 남기지 않음
-# - 테스트 인프라: 임시 DB 정리, DB가 꺼졌을 때 빨리 건너뛰기
+# - 테스트 인프라: 임시 DB 정리, DB가 꺼졌을 때 빨리 건너뛰기, DB가 필수인 CI에서는 건너뛰지 않고
+#   실패
 # [방식] 실제 DB·API·학습 없이 conftest의 메모리 warehouse, unittest.mock의 patch, 가짜 객체로 돈다.
 
 import json
@@ -315,8 +316,11 @@ def test_temporary_database_admin_engine_gives_up_connecting_quickly():
 
 
 # pg_engine fixture를 직접 불러, 접속 실패 때 테스트를 건너뛰고(skip) 실패 이유를 모듈 변수에
-# 기억하는지 본다. monkeypatch로 기억 상태를 테스트 뒤 원래대로 되돌린다.
+# 기억하는지 본다. monkeypatch로 기억 상태를 테스트 뒤 원래대로 되돌린다. CI는
+# BIKE_DEMAND_REQUIRE_DB=1로 돌므로, 기본 동작(건너뛰기)을 보는 이 테스트는 그 값을 지운 상태에서
+# 잰다.
 def test_pg_engine_remembers_an_unreachable_server(monkeypatch, request):
+    monkeypatch.delenv(conftest.REQUIRE_DB_ENV, raising=False)
     monkeypatch.setattr(conftest, "_db_unavailable", None, raising=False)
     with patch.object(conftest, "create_engine", return_value=_unreachable_admin()):
         with pytest.raises(pytest.skip.Exception, match="OperationalError"):
@@ -328,8 +332,32 @@ def test_pg_engine_remembers_an_unreachable_server(monkeypatch, request):
 # DB 테스트가 각각 5초씩 다시 기다리지 않게 한다.
 def test_pg_engine_skips_without_connecting_after_an_unreachable_server(monkeypatch, request):
     """한 번 접속에 실패하면 나머지 DB 테스트는 제한 시간을 다시 기다리지 않고 바로 건너뛴다."""
+    monkeypatch.delenv(conftest.REQUIRE_DB_ENV, raising=False)
     monkeypatch.setattr(conftest, "_db_unavailable", "OperationalError", raising=False)
     with patch.object(conftest, "create_engine", return_value=_unreachable_admin()) as create:
         with pytest.raises(pytest.skip.Exception, match="OperationalError"):
             request.getfixturevalue("pg_engine")
     create.assert_not_called()
+
+
+# BIKE_DEMAND_REQUIRE_DB=1(CI 설정)이면 접속 실패가 건너뛰기가 아니라 실패여야 한다. 첫 접속 실패와
+# 이미 기억한 실패 두 경로를 모두 본다. 이게 없으면 CI의 Postgres 서비스 설정이 틀려도 DB 테스트가
+# 모두 건너뛰어진 채 초록으로 끝난다. "true"는 켜짐으로 보지 않는다(정확히 "1"만).
+@pytest.mark.parametrize("remembered", [None, "OperationalError"])
+def test_pg_engine_fails_instead_of_skipping_when_the_database_is_required(
+    monkeypatch, request, remembered
+):
+    monkeypatch.setenv(conftest.REQUIRE_DB_ENV, "1")
+    monkeypatch.setattr(conftest, "_db_unavailable", remembered, raising=False)
+    with patch.object(conftest, "create_engine", return_value=_unreachable_admin()):
+        with pytest.raises(pytest.fail.Exception, match="OperationalError"):
+            request.getfixturevalue("pg_engine")
+    assert conftest._db_unavailable == "OperationalError"
+
+
+# 켜짐 값은 정확히 "1"뿐이다. 다른 값이면 기본 동작(건너뛰기)을 유지한다.
+def test_pg_engine_require_flag_accepts_only_one(monkeypatch, request):
+    monkeypatch.setenv(conftest.REQUIRE_DB_ENV, "true")
+    monkeypatch.setattr(conftest, "_db_unavailable", "OperationalError", raising=False)
+    with pytest.raises(pytest.skip.Exception, match="OperationalError"):
+        request.getfixturevalue("pg_engine")
