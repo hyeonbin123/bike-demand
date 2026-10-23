@@ -90,9 +90,18 @@ def history_ctes(history: tuple[str, str]) -> str:
     학습·평가 행(_sql)과 서비스용 산출물(model/artifacts.py)이 같은 정의를 쓴다.
     """
     # CTE 내용:
-    # - codes: 대여소ID를 정렬 순서로 0부터 번호 매긴 station_code(범주형 특징). dim_stations 전체
-    #   기준이라 기간과 상관없이 같은 번호다
-    # - district_codes: 자치구 이름 → 번호
+    # - codes: 대여소ID(VARCHAR 'ST-xxx')를 문자열 정렬 순서로 0부터 번호 매긴 station_code(범주형
+    #   특징). 지금 warehouse의 dim_stations 전체에서 매긴 순위라 같은 warehouse 빌드 안에서만 같은
+    #   번호다. 새 반기를 넣어 다시 빌드하면 새 대여소ID가 문자열 정렬 중간에 끼어(예: 'ST-3435'는
+    #   'ST-343'과 'ST-344' 사이) 그 뒤 대여소들의 번호가 밀리고, 새 대여소가 기존 대여소의 번호를
+    #   받는다. 같은 빌드에서 학습하고 바로 채점하는 측정(validate·validate_v2·validate_v3, final
+    #   test)은 이 번호를 그대로 써도 된다. 이미 학습한 모델을 다른 빌드의 행에 쓸 때는 여기서
+    #   번호를 다시 매기지 않고 학습 때 고정한 번호표를 쓴다: 서비스 세대는 artifacts의
+    #   stations.parquet(학습에 없던 대여소는 max_station_code+1부터, predict.feature_rows). 저장해
+    #   둔 validation 부스터를 다시 빌드한 warehouse에서 load_frame으로 채점할 때도 같은 문제가
+    #   생긴다
+    # - district_codes: 자치구 이름 → 번호. 같은 방식의 정렬 순위라 자치구 이름 목록이 바뀌면 같은
+    #   이유로 밀린다(서비스 예측은 자치구 번호도 산출물 번호표를 쓴다)
     # - history: 학습 기간의 격자 행(0건 포함)과 쉬는 날 여부·시각
     # - profile: 대여소×쉬는 날 여부×시각 평균 = profile_mean(가장 큰 특징, gain 약 74~78%)이자
     #   기준선 B0
