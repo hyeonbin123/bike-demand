@@ -3,10 +3,14 @@
 # - 대여소: warehouse에서 upsert(다시 넣으면 고친 값으로 바뀌고 행은 늘지 않음), 실시간에만 나온
 #   대여소는 추가만 하고 과거 이력 대여소는 덮어쓰지 않음, '102. 이름' 꼴 이름 나누기
 # - 스냅샷·예보: 같은 키는 건너뛰어 두 번째 적재는 0행, 시각은 +09:00(KST)으로 저장·조회
+# - 실시간 값 검사(DB 없음): 자전거 수가 0 이상 int32 정수가 아닌 행만 건너뛰고, 거치대 수·좌표처럼
+#   비워도 되는 값이 이상하면 그 값만 비운다. 한 행 때문에 그날 적재 전체가 실패하지 않는다
 # - 마이그레이션: base까지 내렸다가 head로 올리기, 마이그레이션이 실패해도 임시 DB가 지워짐
 # [왜 중요한가] 수집 작업은 10분마다 그날 Parquet 전체를 다시 적재하므로 멱등이 깨지면 스냅샷이
-# 곧바로 중복된다(docs/serving-schema.md 적재 규칙).
+# 곧바로 중복되고, 적재할 수 없는 값이 하나라도 섞이면 그날 자정까지 모든 적재가 실패한다
+# (docs/serving-schema.md 적재 규칙).
 
+import logging
 from datetime import date, datetime, timedelta, timezone
 
 # duckdb: 작은 warehouse 파일(dim_stations만) 만들기. pyarrow: ingest 모듈의 SCHEMA(모든 열
@@ -70,7 +74,7 @@ def write_realtime(bronze, day, fetched_at, rows):
 
 
 # ST-1(과거 이력 대여소)과 ST-9(실시간에만 있는 새 대여소)의 스냅샷을 적재하면 스냅샷 2행·새 대여소
-# 1곳, 같은 파일을 다시 적재하면 (0, 0).
+# 1곳·건너뛴 행 0, 같은 파일을 다시 적재하면 (0, 0, 0).
 # ST-1의 이름은 실시간 이름으로 덮어쓰지 않고(history 유지), ST-9는 이름 앞 번호 9와 거치대 수
 # 20으로 source=realtime 추가된다. 마이크로초까지 있는 fetched_at이 그대로 KST(+09:00) 시각으로
 # 읽히고, 세션 시간대가 Asia/Seoul인지도 확인한다(serving/db.py의 연결 설정).
@@ -91,8 +95,8 @@ def test_realtime_load_adds_new_stations_and_skips_duplicates(pg_engine, tmp_pat
             {**row, "station_id": "ST-9", "station_name": "9. 새 대여소", "bike_count": "7"},
         ],
     )
-    assert load.load_realtime(pg_engine, bronze, day) == (2, 1)
-    assert load.load_realtime(pg_engine, bronze, day) == (0, 0)
+    assert load.load_realtime(pg_engine, bronze, day) == (2, 1, 0)
+    assert load.load_realtime(pg_engine, bronze, day) == (0, 0, 0)
 
     with pg_engine.connect() as conn:
         stations = {s.station_id: s for s in conn.execute(select(Station)).all()}
@@ -108,6 +112,118 @@ def test_realtime_load_adds_new_stations_and_skips_duplicates(pg_engine, tmp_pat
     assert snapshot.fetched_at == datetime(2026, 9, 16, 20, 37, 45, 505669, tzinfo=KST)
     assert snapshot.fetched_at.utcoffset() == timedelta(hours=9)
     assert server_tz == "Asia/Seoul"
+
+
+# 실시간 bronze 한 행(모든 값이 API처럼 문자열). values로 바꿀 칸만 덮어쓴다.
+def realtime_record(**values):
+    return {
+        "fetched_at": "2026-09-29T10:00:00+09:00",
+        "station_id": "ST-1",
+        "station_name": "1. 대여소",
+        "bike_count": "3",
+        "rack_count": "10",
+        "shared": "0",
+        "lat": "37.5",
+        "lon": "127.0",
+        **values,
+    }
+
+
+# 자전거 수(bike_count, NOT NULL)가 적재할 수 없는 값이면 그 행만 건너뛴다: 숫자가 아님('-',
+# 'N/A'), float으로는 무한('1e400', 'inf')·NaN, 음수, int32 상한(2,147,483,647) 초과, 소수부가
+# 있음, 빈 값. 같은 묶음의 정상 행(ST-2)은 그대로 적재 대상이고, 건너뛴 행의 대여소
+# 정보(이름·거치대·좌표)는 대여소 등록에 그대로 쓴다. 고치기 전에는 int(float(value))가 '-'에서
+# ValueError, '1e400'에서 OverflowError를 내 그 파일 전체가 실패했다.
+@pytest.mark.parametrize(
+    "value", ["-", "N/A", "1e400", "inf", "nan", "-3", "2147483648", "3.5", "", None]
+)
+def test_realtime_rows_skip_only_rows_whose_bike_count_cannot_be_stored(value):
+    rows = load.realtime_rows(
+        [realtime_record(bike_count=value), realtime_record(station_id="ST-2")]
+    )
+    assert [s["station_id"] for s in rows.snapshots] == ["ST-2"]
+    assert rows.skipped_rows == 1 and rows.nulled_values == 0
+    assert sorted(s["station_id"] for s in rows.stations) == ["ST-1", "ST-2"]
+
+
+# 정수로 읽을 수 있는 자전거 수는 받는다: '3', 소수 꼴 정수 '3.0', 0, int32 상한 그대로.
+@pytest.mark.parametrize(
+    "value, expected", [("3", 3), ("3.0", 3), ("0", 0), ("2147483647", 2_147_483_647)]
+)
+def test_realtime_rows_accept_integer_bike_counts(value, expected):
+    rows = load.realtime_rows([realtime_record(bike_count=value)])
+    assert rows.snapshots[0]["bike_count"] == expected
+    assert (rows.skipped_rows, rows.nulled_values) == (0, 0)
+
+
+# 비워도 되는(NULL 허용) 값이 이상하면 행은 남기고 그 값만 None으로 바꿔 센다: 거치대 수(스냅샷의
+# rack_count, 새 대여소의 docks)가 0 이상 int32 정수가 아님, 좌표가 유한한 숫자가 아님, 이름 앞
+# 대여소번호가 int32 초과, 이름이 varchar(200)보다 길거나 NUL 문자(PostgreSQL 문자열에 넣을 수
+# 없음)를 담음. 빈 값은 원래 결측이라 세지 않는다.
+@pytest.mark.parametrize(
+    "values, column",
+    [
+        ({"rack_count": "-"}, "docks"),
+        ({"rack_count": "-1"}, "docks"),
+        ({"rack_count": "2147483648"}, "docks"),
+        ({"lat": "nan"}, "lat"),
+        ({"lat": "N/A"}, "lat"),
+        ({"lon": "inf"}, "lon"),
+        ({"lon": "1e400"}, "lon"),
+        ({"station_name": "99999999999. 번호가 너무 큼"}, "station_no"),
+        ({"station_name": "1. " + "가" * 201}, "station_name"),
+        ({"station_name": "1. 이름\x00"}, "station_name"),
+    ],
+)
+def test_realtime_rows_clear_only_the_value_that_cannot_be_stored(values, column):
+    rows = load.realtime_rows([realtime_record(**values)])
+    assert (rows.skipped_rows, rows.nulled_values) == (0, 1)
+    (snapshot,), (station,) = rows.snapshots, rows.stations
+    assert snapshot["bike_count"] == 3
+    assert station[column] is None
+    assert snapshot["rack_count"] == (None if column == "docks" else 10)
+
+
+# 대여소ID가 비었거나, varchar(20)보다 길거나, NUL을 담으면 키로 쓸 수 없어 그 행을 건너뛰고
+# 대여소로도 등록하지 않는다. 비어 있는 값(rack_count 등)은 원래 결측이라 비운 값으로 세지 않는다.
+@pytest.mark.parametrize("station_id", ["", None, "ST-" + "1" * 18, "ST-\x001"])
+def test_realtime_rows_skip_rows_without_a_storable_station_id(station_id):
+    rows = load.realtime_rows(
+        [realtime_record(station_id=station_id), realtime_record(station_id="ST-2", rack_count="")]
+    )
+    assert [s["station_id"] for s in rows.snapshots] == ["ST-2"]
+    assert [s["station_id"] for s in rows.stations] == ["ST-2"]
+    assert (rows.skipped_rows, rows.nulled_values) == (1, 0)
+    assert rows.snapshots[0]["rack_count"] is None
+
+
+# 파일 적재(DB 없음): 오염된 행이 섞인 Parquet도 실패하지 않고, 정상 행만 _insert_ignore로 넘긴
+# 뒤 (새 스냅샷 수, 새 대여소 수, 건너뛴 행 수)를 돌려준다. 건너뛴 행과 비운 값의 수는 날짜 폴더
+# 이름과 함께 WARNING 로그로 남는다. DB에 쓰는 _insert_ignore만 받은 행을 기록하는 가짜로 바꾼다.
+def test_load_realtime_file_skips_bad_rows_and_logs_a_warning(tmp_path, monkeypatch, caplog):
+    inserted: dict[str, list[dict]] = {}
+
+    def insert_ignore(engine, table, rows, keys):
+        inserted[table.name] = list(rows)
+        return len(inserted[table.name])
+
+    monkeypatch.setattr(load, "_insert_ignore", insert_ignore)
+    bronze, day = tmp_path / "bronze", date(2026, 9, 29)
+    write_realtime(
+        bronze,
+        day,
+        "2026-09-29T10:00:00+09:00",
+        [realtime_record(bike_count="-"), realtime_record(station_id="ST-2", rack_count="N/A")],
+    )
+    with caplog.at_level(logging.WARNING, logger="bike_demand.serving.load"):
+        assert load.load_realtime(None, bronze, day) == (1, 2, 1)
+    (snapshot,) = inserted["realtime_snapshots"]
+    assert snapshot["station_id"] == "ST-2"
+    assert (snapshot["bike_count"], snapshot["rack_count"]) == (3, None)
+    assert snapshot["fetched_at"] == datetime(2026, 9, 29, 10, tzinfo=KST)
+    assert sorted(s["station_id"] for s in inserted["stations"]) == ["ST-1", "ST-2"]
+    assert "date=2026-09-29" in caplog.text
+    assert "행 1개" in caplog.text and "값 1개" in caplog.text
 
 
 # 단기예보 두 항목을 두 번 적재하면 처음 2행, 다음 0행. '강수없음' 같은 문자열 값은 그대로 저장되고

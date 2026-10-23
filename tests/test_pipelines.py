@@ -5,6 +5,8 @@
 #   재시도, 0시대 내내 장애). 한 날이 계속 실패해도 다른 날(오늘 포함)은 같은 실행에서 적재한다
 # - 겹친 실행은 잠금으로 막고, 오래된 잠금은 가져가며, 잠금을 빼앗긴 실행도 실제로 적재한 것만
 #   기록한다
+# - 오늘 원본 하나에 넣을 수 없는 값(숫자가 아닌 자전거 수)이 있어도 그 행만 건너뛰고 그날 나머지를
+#   적재하며, 건너뛴 수를 skipped_rows로 알린다
 # - latest-trip-month 명령의 최신 달·말일 계산
 # [왜 중요한가] 실시간 스냅샷은 지나가면 다시 받을 수 없다. 적재가 조용히 빠지면 부족 위험 화면과 v5
 # 측정의 정답 자료에 구멍이 생긴다.
@@ -31,10 +33,12 @@ def day_of(parquet_path):
 
 
 # 가짜 bikeList 응답: 대여소 2곳(ST-1, ST-2), 각 자전거 3대. 한 번 수집할 때마다 스냅샷 2행이
-# 생긴다.
-def bike_list(request: httpx.Request) -> httpx.Response:
+# 생긴다. bike_counts로 대여소별 자전거 수 문자열을 바꿔 값이 오염된 응답을 만들 수 있다.
+def bike_list(request: httpx.Request, bike_counts: dict[str, str] | None = None) -> httpx.Response:
+    counts = bike_counts or {}
     rows = [
-        {"rackTotCnt": "10", "stationName": f"{n}. 대여소", "parkingBikeTotCnt": "3",
+        {"rackTotCnt": "10", "stationName": f"{n}. 대여소",
+         "parkingBikeTotCnt": counts.get(f"ST-{n}", "3"),
          "shared": "30", "stationLatitude": "37.5", "stationLongitude": "127.0",
          "stationId": f"ST-{n}"}
         for n in (1, 2)
@@ -202,7 +206,7 @@ def test_overlapping_runs_do_not_rebuild_and_load_at_the_same_time(tmp_path, mon
 
     old = time.time() - pipelines.STALE_LOCK_SECONDS - 60
     os.utime(lock, (old, old))
-    monkeypatch.setattr(pipelines.load, "load_realtime_file", lambda *a: (2, 0))
+    monkeypatch.setattr(pipelines.load, "load_realtime_file", lambda *a: (2, 0, 0))
     later = datetime(2026, 9, 17, 12, 10, tzinfo=realtime.KST)
     result = pipelines.collect_realtime(None, raw, bronze, SECRET, later, client)
     assert result["days"]["2026-09-17"]["parquet_rows"] == 4
@@ -263,7 +267,7 @@ def test_taken_over_lock_cannot_mark_snapshots_that_were_not_loaded(tmp_path, mo
             # B 적재 직전: 늦게 끝난 A의 재생성이 공용 Parquet을 옛 내용으로 덮는다
             (day_dir / "snapshots.parquet").write_bytes(a_old[0])
         loaded_by_run.append(names_in(path))
-        return 0, 0
+        return 0, 0, 0
 
     monkeypatch.setattr(pipelines.load, "load_realtime_file", load_file)
     pipelines.collect_realtime(None, raw, bronze, SECRET, a_run, client)
@@ -309,7 +313,7 @@ def test_a_failing_past_day_does_not_block_other_days(tmp_path, monkeypatch):
         calls.append(day_of(path))
         if day_of(path) == date(2026, 9, 15):
             raise ValueError("적재할 수 없는 행")
-        return 2, 0
+        return 2, 0, 0
 
     monkeypatch.setattr(pipelines.load, "load_realtime_file", load_file)
     now = datetime(2026, 9, 17, 0, 10, tzinfo=realtime.KST)
@@ -329,3 +333,39 @@ def test_a_failing_past_day_does_not_block_other_days(tmp_path, monkeypatch):
     with pytest.raises(pipelines.LoadFailed):
         pipelines.collect_realtime(None, raw, bronze, SECRET, now.replace(minute=20), client)
     assert calls == [date(2026, 9, 15), date(2026, 9, 17)]
+
+
+# 회귀 테스트: 오늘 10:00 응답에서 ST-1의 자전거 수가 숫자가 아닌 '-'로 왔다. 실행마다 그날 원본
+# 전체로 Parquet을 다시 만들어 적재하므로, 전에는 이 값 하나 때문에 10:00 실행부터 자정까지 그날의
+# 모든 적재가 ValueError(LoadFailed)로 끝나 새 스냅샷이 DB에 하나도 들어가지 않았다. 이제 그 행만
+# 건너뛰고 나머지는 적재하며, 건너뛴 수를 결과의 skipped_rows로 알린다(그날 Parquet 전체를 다시
+# 적재하므로 10:10 실행도 10:00의 같은 행을 다시 건너뛰어 1).
+# 실제 적재 함수(load.load_realtime_file)를 그대로 쓰고 DB에 쓰는 _insert_ignore만 '같은 키는
+# 건너뛰는'(ON CONFLICT DO NOTHING) 가짜로 바꿔 DB 없이 돈다.
+def test_a_bad_value_skips_only_that_row_and_the_rest_of_the_day_loads(tmp_path, monkeypatch):
+    from bike_demand import pipelines
+
+    raw, bronze = tmp_path / "raw", tmp_path / "bronze"
+    stored: dict[str, set] = {}
+
+    def insert_ignore(engine, table, rows, keys):
+        seen = stored.setdefault(table.name, set())
+        before = len(seen)
+        seen.update(tuple(r[k] for k in keys) for r in rows)
+        return len(seen) - before
+
+    monkeypatch.setattr(pipelines.load, "_insert_ignore", insert_ignore)
+    at_10 = datetime(2026, 9, 29, 10, 0, tzinfo=realtime.KST)
+    at_1010 = datetime(2026, 9, 29, 10, 10, tzinfo=realtime.KST)
+    poisoned = httpx.Client(transport=httpx.MockTransport(lambda r: bike_list(r, {"ST-1": "-"})))
+    normal = httpx.Client(transport=httpx.MockTransport(bike_list))
+
+    first = pipelines.collect_realtime(None, raw, bronze, SECRET, at_10, poisoned)
+    second = pipelines.collect_realtime(None, raw, bronze, SECRET, at_1010, normal)
+
+    assert (first["snapshots_inserted"], first["new_stations"], first["skipped_rows"]) == (1, 2, 1)
+    assert (second["snapshots_inserted"], second["new_stations"]) == (2, 0)
+    assert second["skipped_rows"] == second["days"]["2026-09-29"]["skipped_rows"] == 1
+    assert stored["realtime_snapshots"] == {("ST-2", at_10), ("ST-1", at_1010), ("ST-2", at_1010)}
+    loaded = (bronze / "date=2026-09-29" / "loaded.txt").read_text(encoding="utf-8").split()
+    assert loaded == ["100000.json", "101000.json"]

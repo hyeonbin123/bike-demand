@@ -2,7 +2,9 @@
 
 - stations: warehouse의 dim_stations(과거 이력)에서 upsert. 실시간 스냅샷에만 있는 새 대여소는
   load_realtime이 source=realtime으로 추가한다(이미 있으면 건드리지 않음)
-- realtime_snapshots: 날짜별 bronze Parquet에서 추가 (station_id, fetched_at이 같으면 건너뜀)
+- realtime_snapshots: 날짜별 bronze Parquet에서 추가 (station_id, fetched_at이 같으면 건너뜀).
+  값은 행마다 검사해, DB에 넣을 수 없는 대여소ID·자전거 수의 행은 건너뛰고 거치대 수·좌표·이름처럼
+  비워도 되는 값은 그 값만 비운다(realtime_rows). 한 행 때문에 그날 적재 전체가 실패하지 않는다
 - weather_forecasts: 단기예보 bronze Parquet에서 추가 (발표·예보 시각·항목·격자가 같으면 건너뜀)
 """
 
@@ -17,10 +19,14 @@
 
 from __future__ import annotations
 
+import logging
+import math
 import re
 from collections.abc import Iterable, Iterator
+from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path
+from typing import NamedTuple
 
 # duckdb: warehouse의 dim_stations를 읽기 전용으로 읽는다. pyarrow.parquet: bronze Parquet(모든 열이
 # 문자열)을 읽는다. postgresql.insert: PostgreSQL 전용 INSERT … ON CONFLICT를 만든다(표준 insert에는
@@ -38,6 +44,15 @@ from bike_demand.serving.models import RealtimeSnapshot, Station, WeatherForecas
 BATCH = 5000
 # 실시간 API의 대여소 이름은 "102. 망원역 1번출구 앞"처럼 번호가 앞에 붙는다.
 _NAME_WITH_NO = re.compile(r"^\s*(\d+)\.\s*(.*?)\s*$")
+# DB 열이 받을 수 있는 범위(serving/models.py): integer 열의 상한, station_id varchar(20),
+# station_name varchar(200). 넘는 값을 그대로 보내면 PostgreSQL이 그 문장 전체를 거부한다.
+INT32_MAX = 2_147_483_647
+STATION_ID_MAX = 20
+STATION_NAME_MAX = 200
+
+# 적재 경고(건너뛴 행·비운 값)를 남기는 로거. 명령줄·Airflow 실행에는 로깅 설정이 없어 파이썬 기본
+# 처리기가 WARNING 이상을 표준 오류로 내보내므로 작업 로그에 그대로 보인다.
+logger = logging.getLogger(__name__)
 
 
 # 행 목록을 size개씩 잘라 차례로 내준다.
@@ -66,15 +81,40 @@ def _insert_ignore(engine: Engine, table, rows: Iterable[dict], keys: list[str])
     return _count(engine, table) - before
 
 
-# bronze는 모든 값을 문자열로 두므로 숫자로 바꾼다. '3.0'처럼 소수 꼴로 온 정수도 받으려고 float을
-# 거친다. 빈 문자열·None은 None(DB의 NULL).
-def _int(value: str | None) -> int | None:
-    return int(float(value)) if value not in (None, "") else None
+# bronze는 모든 값을 문자열로 두므로 숫자로 바꾼다. 개수(자전거·거치대)는 0 이상 int32 상한 이하의
+# 정수만 받는다. '3.0'처럼 소수 꼴로 온 정수도 받으려고 float을 거친다. 빈 값, 숫자가 아닌 값('-',
+# 'N/A'), float으로 무한·NaN이 되는 값('1e400', 'nan'), 소수부가 있는 값, 음수, 상한 초과는 모두
+# None이다. 전에는 int(float(value))가 '-'에서 ValueError, '1e400'에서 OverflowError를 내 파일 하나
+# 전체의 적재가 실패했다. 빈 값인지(원래 결측)와 잘못된 값인지는 호출하는 쪽이 원래 값으로 가린다.
+def _nonnegative_int(value: str | None) -> int | None:
+    if value in (None, ""):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(number) or not number.is_integer() or not 0 <= number <= INT32_MAX:
+        return None
+    return int(number)
 
 
-# 문자열 → float, 빈 값은 None.
-def _float(value: str | None) -> float | None:
-    return float(value) if value not in (None, "") else None
+# 좌표 같은 실수: 유한한 숫자만 받고 빈 값·숫자가 아님·무한·NaN은 None. double 열은 NaN·무한대를
+# 받지만, 그 대여소를 담는 API 응답이 실패한다(JSON은 NaN·무한대를 담을 수 없어 FastAPI 기본
+# JSONResponse가 allow_nan=False로 거부).
+def _finite_float(value: str | None) -> float | None:
+    if value in (None, ""):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
+
+
+# varchar(limit) 열에 그대로 넣을 수 있는 문자열인지. PostgreSQL 문자열에는 NUL(\x00)을 넣을 수
+# 없고, 길이를 넘으면 그 문장 전체가 거부된다.
+def _storable_text(value: object, limit: int) -> bool:
+    return isinstance(value, str) and len(value) <= limit and "\x00" not in value
 
 
 # warehouse의 dim_stations(대여이력에 나온 모든 대여소, 이름·위치는 가장 최근 대여소 정보 스냅샷
@@ -127,56 +167,122 @@ def split_station_name(name: str | None) -> tuple[int | None, str | None]:
     return int(match.group(1)), match.group(2)
 
 
+# realtime_rows의 결과. snapshots는 realtime_snapshots에, stations는 stations에 넣을 행이다.
+# skipped_rows: 스냅샷으로 넣지 못하고 건너뛴 행 수(대여소ID나 자전거 수를 DB에 넣을 수 없음).
+# nulled_values: 비워도 되는 열(거치대 수·좌표·대여소번호·이름)에 넣을 수 없는 값이 있어 None으로
+# 바꾼 값의 수. 원래 빈 값(결측)은 어느 쪽에도 세지 않는다.
+@dataclass(frozen=True)
+class RealtimeRows:
+    snapshots: list[dict]
+    stations: list[dict]
+    skipped_rows: int
+    nulled_values: int
+
+
+# 실시간 bronze 행(모든 값이 문자열)을 DB에 넣을 사전으로 바꾸는 순수 함수(DB를 쓰지 않음). 행마다
+# 검사해 넣을 수 없는 값이 있는 행만 건너뛰거나 그 값만 비운다.
+# - 대여소ID: 비었거나 varchar(20)보다 길거나 NUL을 담으면 키로 쓸 수 없어 그 행을 건너뛰고
+#   대여소로도 등록하지 않는다(수집은 ID가 빈 응답을 이미 거부하므로 원본에서는 드묾).
+# - 자전거 수(bike_count, NOT NULL): 0 이상 int32 정수가 아니면 그 행은 스냅샷에서 건너뛴다. 그 행의
+#   대여소 정보(이름·거치대·좌표)는 대여소 등록에 그대로 쓴다.
+# - 거치대 수(rack_count, 대여소의 docks)·좌표·이름 앞 대여소번호·이름: 넣을 수 없으면 그 값만 None.
+# 왜 행 단위인가: 수집 작업은 실행마다 그날 원본 전체로 Parquet을 다시 만들어 적재하므로, 전에는 값
+# 하나가 이상한 응답 한 번에 그날 자정까지의 모든 적재가 실패했다. 받을 때 그 쪽을 거부하는 방법은
+# 대여소 하나가 계속 이상한 값을 보내면 수집 전체가 멈추므로 쓰지 않는다.
+# 같은 대여소가 하루 여러 스냅샷에 나오므로 대여소 정보는 대여소ID로 하나만 남긴다(뒤쪽 행이 이김).
+# 실시간 정보에는 자치구가 없어 district는 비운다. fetched_at은 수집기가 쓴 오프셋(+09:00) 붙은 ISO
+# 문자열이라 시간대가 있는 datetime이 된다(이 값이 깨진 파일은 행 단위가 아니라 파일 문제라 예외).
+def realtime_rows(records: Iterable[dict]) -> RealtimeRows:
+    snapshots: list[dict] = []
+    stations: dict[str, dict] = {}
+    skipped = nulled = 0
+    for r in records:
+        station_id = r.get("station_id")
+        if not station_id or not _storable_text(station_id, STATION_ID_MAX):
+            skipped += 1
+            continue
+        rack_count = _nonnegative_int(r.get("rack_count"))
+        lat, lon = _finite_float(r.get("lat")), _finite_float(r.get("lon"))
+        station_no, station_name = split_station_name(r.get("station_name"))
+        # 넣을 수 없는 값만 비운다. 원래 값이 비어 있지 않았는데 None이 된 것만 센다.
+        nulled += sum(
+            parsed is None and raw not in (None, "")
+            for parsed, raw in (
+                (rack_count, r.get("rack_count")),
+                (lat, r.get("lat")),
+                (lon, r.get("lon")),
+            )
+        )
+        if station_no is not None and station_no > INT32_MAX:
+            station_no, nulled = None, nulled + 1
+        if station_name is not None and not _storable_text(station_name, STATION_NAME_MAX):
+            station_name, nulled = None, nulled + 1
+        stations[station_id] = {
+            "station_id": station_id,
+            "station_no": station_no,
+            "station_name": station_name,
+            "lat": lat,
+            "lon": lon,
+            "docks": rack_count,
+            "source": "realtime",
+        }
+        bike_count = _nonnegative_int(r.get("bike_count"))
+        if bike_count is None:
+            skipped += 1
+            continue
+        snapshots.append(
+            {
+                "station_id": station_id,
+                "fetched_at": datetime.fromisoformat(r["fetched_at"]),
+                "bike_count": bike_count,
+                "rack_count": rack_count,
+            }
+        )
+    return RealtimeRows(snapshots, list(stations.values()), skipped, nulled)
+
+
+# load_realtime·load_realtime_file의 결과. 튜플처럼 풀어 쓸 수 있다(snapshots, stations, skipped =
+# load_realtime_file(...)).
+class RealtimeLoadResult(NamedTuple):
+    snapshots_inserted: int  # 새로 넣은 스냅샷 행 수(이미 있던 행은 세지 않음)
+    new_stations: int  # 새로 추가한 대여소 수
+    skipped_rows: int  # 넣을 수 없는 값 때문에 건너뛴 행 수(파일 전체 기준)
+
+
 # 날짜 하나의 정식 Parquet(date=YYYY-MM-DD/snapshots.parquet)을 적재한다. 명령줄 `load realtime
 # --day`(7일보다 오래된 날을 손으로 다시 적재할 때)가 쓴다.
-def load_realtime(engine: Engine, bronze_dir: Path, day: date) -> tuple[int, int]:
-    """(새로 넣은 스냅샷 행 수, 새로 추가한 대여소 수). 그날의 bronze Parquet을 적재한다."""
+def load_realtime(engine: Engine, bronze_dir: Path, day: date) -> RealtimeLoadResult:
+    """그날의 bronze Parquet을 적재한다. (새 스냅샷 행 수, 새 대여소 수, 건너뛴 행 수)."""
     return load_realtime_file(engine, bronze_dir / f"date={day:%Y-%m-%d}" / "snapshots.parquet")
 
 
 # Parquet 파일 하나를 받아 처음 보는 대여소를 stations에 추가하고, 스냅샷을 realtime_snapshots에
-# 넣는다. 둘 다 이미 있으면 건너뛴다. 출력은 (새 스냅샷 행 수, 새 대여소 수).
+# 넣는다. 둘 다 이미 있으면 건너뛴다. 값 검사는 realtime_rows가 하고, 건너뛴 행이나 비운 값이
+# 있으면 날짜 폴더 이름과 함께 WARNING 로그를 남긴다. 수집 작업은 그날 Parquet 전체를 실행마다 다시
+# 적재하므로 같은 나쁜 행이 그날 남은 실행마다 다시 건너뛰어지고 다시 경고된다(행이 늘지는 않음).
+# 출력은 RealtimeLoadResult(새 스냅샷 행 수, 새 대여소 수, 건너뛴 행 수).
 # 파일 경로를 직접 받는 이유: 수집 작업(pipelines.collect_realtime)은 실행마다 자기 임시 Parquet을
 # 만들어 그 파일을 적재한다. 다른 실행이 정식 파일을 바꿔 끼워도 이 실행이 적재하는 내용이 바뀌지
 # 않게 하려는 것이다.
-def load_realtime_file(engine: Engine, path: Path) -> tuple[int, int]:
+def load_realtime_file(engine: Engine, path: Path) -> RealtimeLoadResult:
     """실시간 스냅샷 Parquet 파일 하나를 적재한다(수집 작업은 실행마다 따로 만든 파일을 넘긴다)."""
     records = pq.read_table(path).to_pylist()
-    # 대여소ID가 없거나 자전거 수가 빈 행은 버린다(bike_count는 NOT NULL). fetched_at은
-    # 오프셋(+09:00)이 붙은 ISO 문자열이라 시간대가 있는 datetime이 된다.
-    snapshots = [
-        {
-            "station_id": r["station_id"],
-            "fetched_at": datetime.fromisoformat(r["fetched_at"]),
-            "bike_count": _int(r["bike_count"]),
-            "rack_count": _int(r["rack_count"]),
-        }
-        for r in records
-        if r["station_id"] and r["bike_count"] not in (None, "")
-    ]
-    # 같은 대여소가 하루 여러 스냅샷에 나오므로 대여소ID로 하나만 남긴다(파일 뒤쪽 값이 이김).
-    # 실시간 정보에는 자치구가 없어 district는 비운다.
-    stations: dict[str, dict] = {}
-    for r in records:
-        if not r["station_id"]:
-            continue
-        station_no, station_name = split_station_name(r["station_name"])
-        stations[r["station_id"]] = {
-            "station_id": r["station_id"],
-            "station_no": station_no,
-            "station_name": station_name,
-            "lat": _float(r["lat"]),
-            "lon": _float(r["lon"]),
-            "docks": _int(r["rack_count"]),
-            "source": "realtime",
-        }
+    rows = realtime_rows(records)
+    if rows.skipped_rows or rows.nulled_values:
+        logger.warning(
+            "실시간 적재 %s: 넣을 수 없는 값 때문에 행 %d개를 건너뛰고 값 %d개를 비움 (전체 %d행)",
+            path.parent.name,
+            rows.skipped_rows,
+            rows.nulled_values,
+            len(records),
+        )
     # 대여소는 DO NOTHING으로 넣는다. 이미 있는 대여소(특히 history 출처)를 실시간 값으로 덮어쓰지
     # 않기 위해서다.
-    new_stations = _insert_ignore(engine, Station.__table__, stations.values(), ["station_id"])
+    new_stations = _insert_ignore(engine, Station.__table__, rows.stations, ["station_id"])
     new_snapshots = _insert_ignore(
-        engine, RealtimeSnapshot.__table__, snapshots, ["station_id", "fetched_at"]
+        engine, RealtimeSnapshot.__table__, rows.snapshots, ["station_id", "fetched_at"]
     )
-    return new_snapshots, new_stations
+    return RealtimeLoadResult(new_snapshots, new_stations, rows.skipped_rows)
 
 
 # 단기예보 bronze Parquet(발표·예보 시각·항목·격자·값의 긴 형식) 전체를 weather_forecasts에 넣고 새
@@ -230,7 +336,8 @@ if __name__ == "__main__":
     if args.target == "stations":
         print("stations upserted", load_stations_from_warehouse(engine, args.warehouse))
     elif args.target == "realtime":
-        snapshots, stations = load_realtime(engine, args.bronze, args.day)
-        print("snapshots inserted", snapshots, "new stations", stations)
+        # 건너뛴 행 수는 넣을 수 없는 값(숫자가 아닌 자전거 수 등) 때문에 빠진 스냅샷 행이다.
+        snapshots, stations, skipped = load_realtime(engine, args.bronze, args.day)
+        print("snapshots inserted", snapshots, "new stations", stations, "skipped rows", skipped)
     else:
         print("forecasts inserted", load_forecasts(engine, args.parquet))

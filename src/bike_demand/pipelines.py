@@ -166,7 +166,9 @@ def collect_realtime(
     원본 이름을 bronze 폴더의 loaded.txt에 남기고, 최근 RECOVER_DAYS일 중 원본 목록과 기록이 다른
     날을 오늘과 함께 다시 적재한다. 적재는 이미 있는 행을 건너뛰므로 중복되지 않는다.
     한 날의 적재가 실패해도 나머지 날은 계속 적재·기록하고, 실패한 날이 있으면 모든 날을 시도한 뒤
-    LoadFailed를 낸다(계속 실패하는 지난 날 하나가 오늘 적재를 막지 않게).
+    LoadFailed를 낸다(계속 실패하는 지난 날 하나가 오늘 적재를 막지 않게). 숫자가 아닌 자전거 수처럼
+    DB에 넣을 수 없는 값이 든 행은 실패가 아니라 그 행만 건너뛰고, 그 수를 결과의
+    skipped_rows(날마다, 그리고 합계)로 알린다.
     수집한 원본은 먼저 저장하고, 재생성부터 기록까지는 보통 한 번에 한 실행만 한다(겹치면 LoadBusy).
     7일보다 오래된 날은 매 실행이 살피지 않으므로 `realtime.to_parquet`로 Parquet을 다시 만든 뒤
     `serving.load realtime --day`로 직접 적재한다. 이 수동 적재는 이미 있는 행을 건너뛸 뿐
@@ -199,7 +201,9 @@ def collect_realtime(
             own = parquet.with_name(f"snapshots.{uuid.uuid4().hex}.parquet.part")
             try:
                 rows = realtime.to_parquet(raw_dir, own, target)
-                snapshots, stations = load.load_realtime_file(engine, own)
+                # 넣을 수 없는 값이 든 행은 적재 단계가 그 행만 건너뛰고 수를 돌려준다(skipped).
+                # 그래서 값 하나가 이상한 원본이 그날 남은 적재를 모두 실패시키지 않는다.
+                snapshots, stations, skipped = load.load_realtime_file(engine, own)
                 os.replace(own, parquet)
             except Exception as exc:
                 failed.append((target, exc))
@@ -213,19 +217,22 @@ def collect_realtime(
                 "parquet_rows": rows,
                 "snapshots_inserted": snapshots,
                 "new_stations": stations,
+                "skipped_rows": skipped,
             }
     # 실패한 날짜와 예외 종류만 메시지에 넣고(원본 내용·DB 주소는 넣지 않음), 첫 실패를 원인으로
     # 잇는다.
     if failed:
         summary = ", ".join(f"{d.isoformat()} {type(e).__name__}" for d, e in failed)
         raise LoadFailed(f"실시간 적재 실패: {summary}") from failed[0][1]
-    # 요약: Parquet 행 수는 오늘 것, 넣은 스냅샷·새 대여소 수는 회수한 날까지 합친 값. Airflow
-    # 로그에 이 사전이 찍힌다.
+    # 요약: Parquet 행 수는 오늘 것, 넣은 스냅샷·새 대여소·건너뛴 행 수는 회수한 날까지 합친 값.
+    # Airflow 로그에 이 사전이 찍힌다. 건너뛴 행은 그날 Parquet 전체 기준이라, 같은 나쁜 행이 그날
+    # 실행마다 다시 세어진다(적재 단계의 WARNING 로그에 날짜가 남음).
     today = result["days"][day.isoformat()]
     result.update(
         parquet_rows=today["parquet_rows"],
         snapshots_inserted=sum(d["snapshots_inserted"] for d in result["days"].values()),
         new_stations=sum(d["new_stations"] for d in result["days"].values()),
+        skipped_rows=sum(d["skipped_rows"] for d in result["days"].values()),
     )
     return result
 
