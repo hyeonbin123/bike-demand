@@ -6,6 +6,7 @@ Parquet 변환은 원본 JSON에서 하므로 API를 다시 부르지 않고 몇
 
 인증키는 URL 쿼리에 들어가므로 오류 메시지나 로그에 요청 URL·응답 본문을 남기지 않는다.
 전체 건수(totalCount)보다 덜 받은 달은 저장하지 않는다(관측 자체가 빠진 시간은 허용).
+정상 코드로 0건을 준 끝난 달도 저장하지 않는다(그대로 저장하면 그달은 다시 받지 않아 영구히 빈다).
 """
 
 # [파일 역할] 학습용 관측 날씨를 받는 수집기. 기상청 ASOS 서울(108) 시간자료를 달마다 받아 월별 JSON
@@ -237,6 +238,7 @@ def download(
     """달마다 (month, 상태)를 돌려준다. 상태: exists / incomplete / saved 받은수/그달시간수.
 
     관측이 빠진 시간이 있어도 받은 그대로 저장한다. 빠진 시간은 dbt 테스트에서 드러난다.
+    다만 끝난 달인데 0건이면 저장하지 않고 ApiError로 멈춘다(다음 실행이 그달을 다시 받는다).
     """
     http = client or httpx.Client(timeout=30)
     try:
@@ -250,6 +252,14 @@ def download(
                 yield month, "incomplete"
                 continue
             items = fetch_month(http, service_key, month, station)
+            # 결과 코드 00 + totalCount 0이면 쪽 검사는 '받을 것이 없음'으로 통과한다. 그대로
+            # 저장하면 파일 존재 = 다 받은 달이라 그달은 다시 받지 않고, 그달 날씨가 영구히 빈 채
+            # dbt build도 통과한다(dim_hours.temp_c의 not_null은 달력 마지막 시간 때문에 warn).
+            # 서울(108) 관측소가 한 달 내내 관측하지 않는 일은 사실상 없으므로(2023-01~2026-06은
+            # 30,648시간을 빠짐없이 받음, docs/data.md) 끝난 달의 0건은 응답 이상으로 보고 저장하지
+            # 않고 멈춘다. 일부만 빠진 달은 위 docstring대로 받은 그대로 둔다.
+            if not items:
+                raise ApiError(f"{month} 관측 0건: 저장하지 않음")
             target.parent.mkdir(parents=True, exist_ok=True)
             # 임시 파일에 쓰고 os.replace로 바꿔, 중간에 멈춰도 반쯤 쓴 파일이 '다 받은 달'로 남지
             # 않게 한다. 상태의 '받은 수/그달 시간 수'로 관측이 빠진 시간이 있는지 바로 보인다.

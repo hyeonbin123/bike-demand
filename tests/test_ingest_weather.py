@@ -124,6 +124,34 @@ def test_short_page_that_never_recovers_saves_nothing(tmp_path, monkeypatch):
     assert not weather.raw_path(raw, "2023-01").exists()
 
 
+# 결과 코드는 정상(00)인데 끝난 달 전체가 0건(totalCount 0, items 빈 문자열)이면, 쪽 검사로는 '받을
+# 것이 없음'과 구분되지 않는다. 파일이 있으면 그달은 다시 받지 않으므로 그대로 저장하면 그달 날씨가
+# 영구히 빈다. 그래서 저장하지 않고 ApiError로 멈추며, 다음 실행은 API를 다시 부른다. 고치기 전에는
+# 'saved 0/744'로 저장되고 다음 실행은 'exists'였다.
+def test_complete_month_with_zero_items_is_not_saved(tmp_path):
+    calls = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request.url.params["startDt"])
+        body = {
+            "response": {
+                "header": {"resultCode": "00", "resultMsg": "NORMAL_SERVICE"},
+                "body": {"dataType": "JSON", "items": "", "totalCount": 0},
+            }
+        }
+        return httpx.Response(200, json=body)
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    raw = tmp_path / "raw"
+    for _ in range(2):
+        with pytest.raises(weather.ApiError, match="0건") as info:
+            list(weather.download(raw, ["2026-07"], SECRET, date(2027, 1, 20), client))
+        assert SECRET not in str(info.value)
+        assert not weather.raw_path(raw, "2026-07").exists()
+    assert calls == ["20260701", "20260701"]
+    assert not list(raw.rglob("*.tmp"))
+
+
 # 관측소가 기록하지 못한 시간이 있으면 API도 전체 건수를 그만큼 적게 알린다(744 대신 700). 이때는
 # 오류가 아니라 받은 그대로 쓴다(빠진 시간은 dbt 테스트에서 드러남, download docstring).
 def test_missing_observation_hours_are_allowed_when_total_matches():
