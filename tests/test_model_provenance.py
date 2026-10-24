@@ -13,12 +13,15 @@
 # - 파일 지문: 기록(serving.json의 provenance.files 또는 넘긴 사전)과 다른 파일·빠진 파일을 보고
 # - git 상태·warehouse 지문·수집 결과의 모양. git 명령은 주입한 함수로 흉내 내 개발 중 작업 트리에
 #   흔들리지 않는다
+# - scripts/generation_manifest.py: 세대 폴더의 파일(serving.json 포함) 지문·검사 보고·메모를
+#   폴더 밖에 남기는 읽기 전용 스크립트. 출력 경로가 세대 폴더 안이면 거부한다
 # [왜 중요한가] 고정한 세대로 나중의 warehouse에서 채점·예측할 때 입력이 학습 때와 같은지 코드가
 # 확인하는 관문이다. 범주형 특징 station_code는 'warehouse의 대여소ID 문자열 정렬 순위'라 새
 # 대여소가 들어오면 기존 대여소의 번호가 밀려 다른 대여소의 트리 분기를 타게 된다. 또 세대가 어느
 # 코드 커밋·어느 라이브러리·어느 자료로 만들어졌는지 남아야 결과를 증명할 수 있다.
 
 import hashlib
+import importlib.util
 import json
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -88,6 +91,21 @@ def tiny_booster(names):
 
 def sha256(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
+
+
+# scripts/는 패키지가 아니라 import할 수 없으므로 파일 경로로 불러온다
+# (tests/test_check_prediction_level.py와 같은 방식).
+MANIFEST_SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "generation_manifest.py"
+
+
+# importlib로 스크립트 파일을 모듈로 읽는다. if __name__ == '__main__' 아래 실행 부분은 돌지
+# 않는다.
+def load_manifest_script():
+    spec = importlib.util.spec_from_file_location("generation_manifest", MANIFEST_SCRIPT)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 # --- 번호 밀림 회귀 ---------------------------------------------------------------------------
@@ -423,3 +441,63 @@ def test_collect_gathers_versions_files_and_warehouse_fingerprint(two_year_wareh
     assert "serving.json" not in record["files"] and record["files"]["model.txt"] == sha256(b"fake")
     datetime.fromisoformat(record["recorded_at"])  # KST ISO 시각
     json.dumps(record)  # 그대로 JSON으로 쓸 수 있다
+
+
+# --- scripts/generation_manifest.py: 세대 폴더 밖에 남기는 읽기 전용 지문 ---------------
+
+
+# 세대 폴더의 모든 파일(serving.json 포함)마다 SHA-256과 바이트 수를 적고, model.txt가 있으면
+# verify_generation 보고(warehouse 대조 없음)를 붙이고, 메모는 그대로 담는다. 세대 폴더 안에는
+# 아무것도 쓰지 않아 지문이 그대로다. model.txt가 없으면 검사 없이 지문만 남기고, artifacts/가
+# 없는 폴더는 세대 폴더가 아니라 멈춘다.
+def test_manifest_lists_every_file_and_verifies_the_saved_model(two_year_warehouse, tmp_path):
+    script = load_manifest_script()
+    gen = tmp_path / "gen"
+    export_generation(two_year_warehouse, gen)
+    tiny_booster(LEVELED).save_model(str(gen / "model.txt"))
+    (gen / "serving.json").write_text("{}", "utf-8")
+    before = provenance.file_digests(gen)
+    assert "serving.json" in before and len(before) == 8
+
+    result = script.manifest(gen, ["메모 하나", "메모 둘"])
+    assert result["generation"] == "gen" and result["directory"] == gen.resolve().as_posix()
+    assert set(result["files"]) == set(before)
+    for name, info in result["files"].items():
+        assert info == {"sha256": before[name], "bytes": (gen / name).stat().st_size}
+    check = result["verification"]
+    assert check["ok"] and check["features"]["match"] and not check["has_provenance"]
+    assert check["codes"] == {"checked": False} and check["files"] == {"checked": False}
+    assert result["notes"] == ["메모 하나", "메모 둘"]
+    datetime.fromisoformat(result["recorded_at"])
+    json.dumps(result, ensure_ascii=False)  # 그대로 JSON으로 쓸 수 있다
+    assert provenance.file_digests(gen) == before  # 세대 폴더에는 아무것도 쓰지 않았다
+
+    (gen / "model.txt").unlink()
+    assert script.manifest(gen)["verification"] is None
+    with pytest.raises(SystemExit, match="세대 폴더가 아님"):
+        script.manifest(tmp_path / "not-a-generation")
+
+
+# 결과 파일은 세대 폴더 밖에만 쓴다: 폴더 바로 아래든 artifacts/ 아래든 안이면 거부하고, 이름이
+# 같은 글자로 시작하는 다른 폴더(gen2)나 형제 폴더(provenance/)는 밖이라 그대로 돌려준다.
+def test_manifest_output_inside_the_generation_folder_is_refused(tmp_path):
+    script = load_manifest_script()
+    gen = tmp_path / "generations" / "gen"
+    (gen / "artifacts").mkdir(parents=True)
+    for inside in (gen / "manifest.json", gen / "artifacts" / "manifest.json"):
+        with pytest.raises(SystemExit, match="세대 폴더 안"):
+            script.checked_out_path(inside, gen)
+    for outside in (
+        tmp_path / "generations" / "gen2" / "manifest.json",
+        tmp_path / "provenance" / "gen.json",
+    ):
+        assert script.checked_out_path(outside, gen) == outside
+
+
+# 메모 파일은 한 줄에 메모 하나이고 빈 줄과 앞뒤 공백은 뺀다(Windows 콘솔에서 한글 인자가
+# 깨지는 일을 피해 파일로도 받는다).
+def test_read_notes_keeps_one_note_per_line_and_drops_blank_lines(tmp_path):
+    script = load_manifest_script()
+    path = tmp_path / "notes.txt"
+    path.write_bytes("첫 메모\n\n  둘째 메모  \n\n".encode())
+    assert script.read_notes(path) == ["첫 메모", "둘째 메모"]
