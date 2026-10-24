@@ -10,10 +10,15 @@
 # 수 같은 lag 특징은 서비스 때 없으므로(대여이력은 반기 공개) 쓰지 않고, 대여소 패턴·추세는
 # Window.history(학습 기간)에서만 계산한다.
 # [구성] 특징 목록 상수 → 기간(Window) → 학습 기간 CTE(history_ctes) → v2 수준 특징 SQL 조각 → v3
-# 시점별 대여소 정보 SQL 조각 → 전체 SQL 조립(_sql) → 실행(load_frame) → 행렬 변환(feature_matrix).
+# 시점별 대여소 정보 SQL 조각 → 전체 SQL 조립(_sql) → 실행(load_frame) → 행 순서 고정(sort_frame) →
+# 행렬 변환(feature_matrix).
+# [행 순서] _sql에는 ORDER BY가 없어 DuckDB가 실행마다 다른 행 순서를 돌려준다. load_frame은 결과를
+# (station_code, day_index, hour_of_day) 오름차순으로 다시 놓아 같은 자료면 늘 같은 순서를 돌려준다
+# (docs/experiments.md '학습 행 순서 고정과 보조 지표', 2026-10-24). 그 전의 측정(v1~v5)과 서비스
+# 세대는 정렬 없이 학습한 것이다.
 # [연결] model/validate.py·validate_v2.py·validate_v3.py(측정), model/final.py(test·서비스 학습),
 # model/artifacts.py(서비스용 산출물이 같은 CTE 정의를 씀), model/predict.py(서비스 예측이 같은 특징
-# 순서·반기 번호를 씀).
+# 순서·반기 번호를 씀), scripts/check_training_determinism.py(정렬 뒤 재학습 재현 확인).
 
 from __future__ import annotations
 
@@ -313,19 +318,48 @@ where g.hour_start >= '{rows_start}' and g.hour_start < '{rows_end}'
 """
 
 
+# 행 순서를 (station_code, day_index, hour_of_day) 오름차순으로 고정한다. 세 값은 대여소×시각 격자의
+# 행마다 유일하므로(대여소 번호, 날짜, 시각) 입력 순서가 어떻든 같은 순열이 나온다. 모든 열을 같은
+# 순열로 한 열씩 새 배열로 바꾸며 옛 배열을 놓으므로 정점 메모리는 순열 배열(int64, 행 수 × 8 B) +
+# 열 하나만큼 늘어난다.
+# [왜 정렬하나] _sql에는 ORDER BY가 없어 DuckDB가 실행마다 다른 행 순서를 돌려준다. LightGBM은 구간
+# 경계를 표본 행(bin_construct_sample_cnt 200,000)으로 정하고 bagging(bagging_fraction 0.8)도 행
+# 번호로 고르므로, 같은 코드·자료·seed 42로 다시 학습해도 다른 모델이 나왔다(학습 2023-11~12
+# 100라운드를 두 번 돌리면 모델 SHA-256이 다르고 2024-01 MAE 0.757477 대 0.756576). 정렬 뒤에는 같은
+# 입력이면 같은 모델이 나온다(docs/experiments.md '학습 행 순서 고정과 보조 지표'의 H1 확인 실행).
+# [왜 SQL ORDER BY가 아니라 numpy인가] 정렬 키 세 개(좁은 열)만 정렬하고 나머지 열은 순열대로 옮기면
+# 돼, DuckDB가 20여 열의 넓은 결과 행 전체를 정렬하는 것보다 메모리 정점이 작을 것으로 보고
+# 골랐다(DuckDB ORDER BY 비용은 재지 않았다).
+# 호출 위치: load_frame(기본), tests/test_model_frames.py.
+def sort_frame(frame: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
+    """frame의 모든 열을 (station_code, day_index, hour_of_day) 오름차순으로 제자리에서 다시 놓는다.
+
+    같은 사전을 돌려준다. 세 키 열이 없으면 KeyError.
+    """
+    order = np.lexsort((frame["hour_of_day"], frame["day_index"], frame["station_code"]))
+    for name in frame:
+        frame[name] = frame[name][order]
+    return frame
+
+
 # 호출 위치: validate.py, validate_v2.py, validate_v3.py, final.py, tests(test_model_frames.py,
-# test_model_levels.py, test_model_predict.py).
+# test_model_levels.py, test_model_predict.py), scripts/check_training_determinism.py.
 def load_frame(
     con: duckdb.DuckDBPyConnection,
     window: Window,
     only_active_stations: bool,
     with_levels: bool = False,
     asof_stations: bool = False,
+    sort_rows: bool = True,
 ) -> dict[str, np.ndarray]:
     """열 이름 → numpy 배열. float32(특징·목표), day_index는 int64.
 
+    행은 (station_code, day_index, hour_of_day) 오름차순이다(sort_rows=True, 기본).
     with_levels: LEVEL_FEATURES(v2)도 만든다. 격자 전체에서 행보다 앞선 반기만 읽는다.
     asof_stations: 거치대 수·좌표·자치구를 행보다 앞선 대여소 정보 스냅샷에서 가져온다(v3, T24).
+    sort_rows: False면 DuckDB가 돌려준 순서 그대로 둔다(실행마다 다름). 2026-10-24 정렬 전 동작을
+        재현하는 진단(scripts/check_training_determinism.py --no-sort)에만 쓰고, 측정·학습 코드는
+        기본값을 쓴다.
     """
     # fetchnumpy는 열마다 numpy 배열을 준다. 결측이 있는 열은 masked array로 오므로 NaN으로 채운
     # float32로 바꾼다(LightGBM은 NaN을 결측으로 처리). 메모리를 아끼려고 특징은 float32로 두고,
@@ -338,7 +372,10 @@ def load_frame(
         if hasattr(column, "filled"):  # 결측이 있는 열은 masked array로 온다
             column = column.astype(np.float32).filled(np.nan)
         out[name] = column if name == "day_index" else column.astype(np.float32, copy=False)
-    return out
+    # 형 변환을 마친 뒤 정렬한다(masked array보다 float32 배열을 옮기는 쪽이 싸다). fetchnumpy 결과
+    # 사전은 여기서 더 참조하지 않으므로 옛 배열은 열마다 바로 놓인다.
+    del arrays
+    return sort_frame(out) if sort_rows else out
 
 
 # 열 사전에서 features 순서대로 (행 수 × 특징 수) float32 행렬을 만든다. 행렬을 한 번에 할당하고
