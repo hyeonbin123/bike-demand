@@ -9,8 +9,9 @@
 # Postgres에서만 읽고 쓰지 않는다.
 # [핵심 규칙] (1) 한 응답 안에서는 예측 버전(model_version)을 하나만 쓴다: created_at이 가장 늦은
 # 묶음(latest_version). 예보 발표마다 새 묶음이 쌓여 같은 시간을 여러 버전이 예측하기 때문이다. (2)
-# 시각은 모두 KST로 돌려준다. (3) DB에 접속하지 못하면 모든 요청이 503 JSON. 자세한 계약은
-# docs/api.md.
+# 시각은 모두 KST로 돌려준다. (3) DB에 접속하지 못하면 모든 요청이 503 JSON. (4) 경로·쿼리 값의
+# 범위는 Path·Query 선언으로 제한해, 형식은 맞지만 처리할 수 없는 값(먼 미래 날짜, NUL이 든
+# 문자열)은 DB에 닿기 전에 422다. 자세한 계약은 docs/api.md.
 # [설계 이유] 현재 시각과 DB 엔진을 FastAPI 의존성으로 주입해, 테스트가 시각을 고정하고 임시 DB를
 # 끼울 수 있게 했다(tests/test_api.py의 dependency_overrides).
 # [연결] api/shortage.py(부족 계산), serving/db.py(엔진), serving/models.py(테이블).
@@ -24,11 +25,13 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Annotated
 
-# FastAPI: 경로·쿼리 검증(Query의 범위를 벗어나면 422), 의존성 주입(Depends), 예외 처리기, 정적 파일
-# 제공. pydantic BaseModel: 응답 형식을 선언해 docs/api.md의 필드와 타입을 코드로 고정한다.
+# FastAPI: 경로·쿼리 검증(Path·Query의 범위를 벗어나면 422. fastapi.Path는 pathlib.Path와 이름이
+# 겹쳐 PathParam으로 바꿔 부름), 의존성 주입(Depends), 예외 처리기, 정적 파일 제공. pydantic
+# BaseModel: 응답 형식을 선언해 docs/api.md의 필드와 타입을 코드로 고정한다.
 # SQLAlchemy Core의 select로 쿼리를 만든다. OperationalError(연결 실패·끊김)와 풀 대기 시간
 # 초과(TimeoutError, 내장 TimeoutError와 이름이 겹쳐 PoolTimeout으로 바꿔 부름)는 503 처리기에 쓴다.
 from fastapi import Depends, FastAPI, HTTPException, Query
+from fastapi import Path as PathParam
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -49,6 +52,33 @@ logger = logging.getLogger(__name__)
 KST = timezone(timedelta(hours=9))
 DETAIL_HOURS = 6
 NOTE = "반납은 반영하지 않은 값"
+
+# 경로·쿼리 값의 범위. 핸들러 안의 if문이 아니라 Path·Query 선언으로 두어, FastAPI가 DB를 조회하기
+# 전에 422로 거르고(docs/api.md 공통) /openapi.json에도 같은 제약이 드러나게 한다.
+# - STATION_ID_PATTERN: 대여소ID는 영문자·숫자·하이픈 1~20자. stations.station_id가 varchar(20)이고
+#   저장된 값은 모두 'ST-숫자' 7자 이하다(docs/serving-schema.md). NUL(0x00)이 든 문자열은
+#   PostgreSQL text에 들어갈 수 없어 psycopg가 DataError를 내는데, 이는 503 처리기가 잡는
+#   OperationalError가 아니라 500이 됐다. 선언으로 막으면 DB에 닿지 않는다
+# - DISTRICT_MAX_LENGTH·DISTRICT_PATTERN: 자치구 필터는 50자 이하(stations.district varchar(50)),
+#   제어 문자(U+0000~U+001F) 없음. 저장된 자치구 이름 25개는 모두 4자 이하라 실제 값은 영향이 없고,
+#   빈 문자열은 전처럼 통과한다(어느 자치구와도 같지 않아 빈 목록)
+# - DATE_MIN·DATE_MAX: /predictions의 date는 2000-01-01~2100-12-31. 자료는 2023년부터고, 범위 없이
+#   받으면 date.max(9999-12-31)의 '다음 날 0시'(start + 1일)를 만들 수 없어 OverflowError로 500이
+#   났다
+STATION_ID_PATTERN = r"^[A-Za-z0-9-]{1,20}$"
+DISTRICT_MAX_LENGTH = 50
+DISTRICT_PATTERN = r"^[^\x00-\x1f]*$"
+DATE_MIN = date(2000, 1, 1)
+DATE_MAX = date(2100, 12, 31)
+
+# 위 범위를 붙인 인자 타입 별칭. 같은 범위를 여러 엔드포인트가 똑같이 쓴다(대여소ID는
+# /stations/{id}·/predictions/{id}, 자치구는 /stations·/shortage-risk).
+StationIdPath = Annotated[str, PathParam(pattern=STATION_ID_PATTERN)]
+DistrictQuery = Annotated[
+    str | None, Query(max_length=DISTRICT_MAX_LENGTH, pattern=DISTRICT_PATTERN)
+]
+# 쿼리 이름 date가 datetime.date 타입 이름과 겹치므로 인자 이름은 day로 두고 alias로 받는다.
+DateQuery = Annotated[date, Query(alias="date", ge=DATE_MIN, le=DATE_MAX)]
 
 
 # 기본 엔진은 첫 요청 때 한 번만 만들고 그 뒤로는 같은 연결 풀을 재사용한다. 모듈을 import할 때
@@ -233,9 +263,10 @@ def health(engine: EngineDep) -> Health:
     )
 
 
-# 대여소 목록. district는 자치구 이름과 정확히 같을 때만 거른다. station_id 순.
+# 대여소 목록. district는 자치구 이름과 정확히 같을 때만 거른다(범위는 DistrictQuery). station_id
+# 순.
 @app.get("/stations", response_model=list[StationOut])
-def stations(engine: EngineDep, district: str | None = None) -> list[StationOut]:
+def stations(engine: EngineDep, district: DistrictQuery = None) -> list[StationOut]:
     query = select(*STATION_COLUMNS).order_by(Station.station_id)
     if district is not None:
         query = query.where(Station.district == district)
@@ -244,9 +275,10 @@ def stations(engine: EngineDep, district: str | None = None) -> list[StationOut]
 
 
 # 대여소 한 곳의 정보 + 가장 최근 스냅샷 + 현재 시각이 든 시간부터 6시간의 예측. 대시보드에서
-# 대여소를 고르면 부르는 경로다. 없는 대여소는 404.
+# 대여소를 고르면 부르는 경로다. 없는 대여소는 404(대여소ID 형식이 StationIdPath 밖이면 그 전에
+# 422).
 @app.get("/stations/{station_id}", response_model=StationDetail)
-def station_detail(station_id: str, engine: EngineDep, now: NowDep) -> StationDetail:
+def station_detail(station_id: StationIdPath, engine: EngineDep, now: NowDep) -> StationDetail:
     # 현재 시각이 든 시간의 정시. 예: 08:20이면 08시부터 6시간.
     first = _kst(now).replace(minute=0, second=0, microsecond=0)
     with engine.connect() as conn:
@@ -312,10 +344,10 @@ def shortage_risk(
     engine: EngineDep,
     now: NowDep,
     # 쿼리 범위는 Query로 검증하고, 벗어나면 FastAPI가 422를 낸다. hours 1~6, limit 1~500, 스냅샷
-    # 나이 1~180분(기본 30분).
+    # 나이 1~180분(기본 30분), 자치구는 DistrictQuery(50자 이하, 제어 문자 없음).
     hours: Annotated[int, Query(ge=1, le=6)] = 3,
     limit: Annotated[int, Query(ge=1, le=500)] = 50,
-    district: str | None = None,
+    district: DistrictQuery = None,
     max_snapshot_age_minutes: Annotated[int, Query(ge=1, le=180)] = 30,
 ) -> ShortageRisk:
     now = _kst(now)
@@ -428,14 +460,14 @@ def shortage_risk(
     )
 
 
-# 대여소 한 곳의 하루(KST 0~23시) 시간별 예측. 쿼리 이름 date가 datetime.date 타입 이름과 겹치므로
-# 인자 이름은 day로 두고 alias로 받는다. 없는 대여소는 404, 그날 예측이 없으면 model_version null과
-# 빈 목록.
+# 대여소 한 곳의 하루(KST 0~23시) 시간별 예측. 날짜는 DateQuery(쿼리 이름 date, 2000~2100년),
+# 대여소ID는 StationIdPath 범위 안이어야 한다. 없는 대여소는 404, 그날 예측이 없으면 model_version
+# null과 빈 목록.
 @app.get("/predictions/{station_id}", response_model=DailyPredictions)
 def daily_predictions(
-    station_id: str, engine: EngineDep, day: Annotated[date, Query(alias="date")]
+    station_id: StationIdPath, engine: EngineDep, day: DateQuery
 ) -> DailyPredictions:
-    # 요청 날짜의 KST 0시 ~ 다음 날 0시.
+    # 요청 날짜의 KST 0시 ~ 다음 날 0시. day가 DATE_MAX 이하라 다음 날 계산이 넘치지 않는다.
     start = datetime(day.year, day.month, day.day, tzinfo=KST)
     end = start + timedelta(days=1)
     with engine.connect() as conn:

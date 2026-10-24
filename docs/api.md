@@ -7,6 +7,7 @@ FastAPI 서비스(`src/bike_demand/api/`)가 지키는 요청·응답 형식. �
 - 오류 응답 형식은 FastAPI 기본 `{"detail": ...}`
   - 404: 없는 대여소
   - 422: 요청 값 형식·범위 오류
+    - 경로·쿼리 값의 범위: `station_id`는 영문자·숫자·하이픈 1~20자(`^[A-Za-z0-9-]{1,20}$`), `district`는 50자 이하이고 제어 문자(U+0000~U+001F)가 없어야 하며, `date`는 2000-01-01~2100-12-31. 벗어나면 DB를 조회하지 않고 422
   - 503: 판단에 필요한 최신 데이터가 없음(`detail`에 무엇이 없는지)
   - DB에 접속하지 못하면(연결 실패, 연결 풀 대기 시간 초과) `/health`를 포함한 모든 요청이 503 `{"detail": "database unavailable"}`. 원인은 서버 로그에만 남긴다. 쿼리 오류 같은 그 밖의 서버 오류는 500
 - 인증 없음(읽기 전용 공개 데이터)
@@ -33,7 +34,7 @@ FastAPI 서비스(`src/bike_demand/api/`)가 지키는 요청·응답 형식. �
 - 스냅샷·예측이 하나도 없으면 해당 값은 `null`(상태는 `ok`)
 
 ## `GET /stations`
-쿼리: `district`(선택, 자치구 이름 정확히 일치)
+쿼리: `district`(선택, 자치구 이름 정확히 일치. 50자 이하, 제어 문자 없음)
 
 ```json
 [
@@ -58,6 +59,7 @@ FastAPI 서비스(`src/bike_demand/api/`)가 지키는 요청·응답 형식. �
   "model_version": "v1-..."
 }
 ```
+- `station_id`: 영문자·숫자·하이픈 1~20자. 형식이 범위 밖이면 422, 형식은 맞지만 없는 대여소면 404
 - `snapshot`: 없으면 `null`
 - `predictions`: 현재 시각이 든 시간부터 6시간 중 고른 버전에 이 대여소의 값이 있는 시간만(순서대로). 없으면 빈 목록(이때도 `model_version`은 고른 버전, `predictions` 테이블이 비었을 때만 `null`)
 
@@ -69,7 +71,7 @@ FastAPI 서비스(`src/bike_demand/api/`)가 지키는 요청·응답 형식. �
 |---|---|---|---|
 | `hours` | 3 | 1~6 | 앞으로 몇 시간을 볼지 |
 | `limit` | 50 | 1~500 | 최대 몇 곳 |
-| `district` | 없음 | | 자치구 필터 |
+| `district` | 없음 | 50자 이하, 제어 문자 없음 | 자치구 필터 |
 | `max_snapshot_age_minutes` | 30 | 1~180 | 이보다 오래된 스냅샷을 가진 대여소는 뺌 |
 
 계산 (대여소마다)
@@ -102,7 +104,7 @@ FastAPI 서비스(`src/bike_demand/api/`)가 지키는 요청·응답 형식. �
 - 반올림은 위 "숫자 반올림" 규칙
 
 ## `GET /predictions/{station_id}`
-쿼리: `date`(필수, `YYYY-MM-DD`, KST 날짜)
+쿼리: `date`(필수, `YYYY-MM-DD`, KST 날짜, 2000-01-01~2100-12-31). `station_id`는 `/stations/{station_id}`와 같은 형식(영문자·숫자·하이픈 1~20자)
 
 ```json
 {"station_id": "ST-1121", "date": "2026-09-17", "model_version": "v1-...",

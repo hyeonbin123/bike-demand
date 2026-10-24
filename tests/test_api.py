@@ -376,3 +376,136 @@ def test_pool_timeout_is_503_on_every_endpoint():
         main.app.dependency_overrides.clear()
         held.close()
         busy.dispose()
+
+
+# ---------------------------------------------------------------------------------------------
+# 입력 범위 선언(docs/api.md 공통 '422'와 각 절의 범위). DB 없이 돈다.
+# [배경] 형식은 맞지만 처리할 수 없는 입력이 500이 됐다: date=9999-12-31은 '다음 날 0시'를 만드는
+# start + timedelta(days=1)에서 OverflowError(DB에 닿기 전), NUL(%00)이 든 대여소ID·자치구는
+# PostgreSQL text에 들어갈 수 없어 psycopg DataError(503 처리기가 잡는 OperationalError가 아님).
+# 지금은 경로·쿼리 선언(Path·Query의 pattern·max_length·ge·le)이 DB를 조회하기 전에 422로 거른다.
+# [방식] connect()가 불린 횟수를 세고 OperationalError를 내는 가짜 엔진을 끼운다. 선언을 통과한
+# 요청은 DB 단계에 닿아 503 'database unavailable'(호출 1회), 선언에서 막힌 요청은 422(호출 0회)다.
+# ---------------------------------------------------------------------------------------------
+class CountingUnavailableEngine:
+    """connect()를 부르면 횟수를 세고 '접속 거부'를 낸다. 요청이 DB 단계에 닿았는지만 본다."""
+
+    def __init__(self):
+        self.calls = 0
+
+    def connect(self):
+        from sqlalchemy.exc import OperationalError
+
+        self.calls += 1
+        raise OperationalError("connect", {}, Exception("connection refused"))
+
+
+# 가짜 엔진과 고정 시각을 끼운 (엔진, TestClient) 쌍. raise_server_exceptions=False라 처리되지 않은
+# 서버 예외도 500 응답으로 받아 상태 코드를 비교할 수 있다(고치기 전 OverflowError가 그랬다).
+@pytest.fixture
+def probe():
+    engine = CountingUnavailableEngine()
+    main.app.dependency_overrides[main.get_engine] = lambda: engine
+    main.app.dependency_overrides[main.get_now] = lambda: NOW
+    try:
+        yield engine, TestClient(main.app, raise_server_exceptions=False)
+    finally:
+        main.app.dependency_overrides.clear()
+
+
+# 범위 밖 입력: (경로, 쿼리 사전). 모두 422여야 하고 DB를 조회하지 않아야 한다.
+OUT_OF_RANGE = [
+    # 날짜: 2000-01-01~2100-12-31 밖. 9999-12-31은 고치기 전 500이었고, 형식 오류는 전부터 422
+    ("/predictions/ST-1", {"date": "9999-12-31"}),
+    ("/predictions/ST-1", {"date": "2101-01-01"}),
+    ("/predictions/ST-1", {"date": "1999-12-31"}),
+    ("/predictions/ST-1", {"date": "2026-13-01"}),
+    # NUL 문자(%00): 고치기 전에는 DB 단계까지 가서 psycopg DataError로 500
+    ("/stations/%00", None),
+    ("/predictions/%00", {"date": "2026-09-20"}),
+    ("/stations", {"district": "\x00"}),
+    ("/shortage-risk", {"district": "\x00"}),
+    # 대여소ID: 영문자·숫자·하이픈 1~20자(stations.station_id는 varchar(20), 저장된 값은 모두
+    # 'ST-숫자' 7자 이하). 21자, 밑줄, 공백(%20)은 밖
+    ("/stations/" + "A" * 21, None),
+    ("/stations/ST_1", None),
+    ("/predictions/ST%201", {"date": "2026-09-20"}),
+    # 자치구: 50자 이하(stations.district는 varchar(50)), 제어 문자 없음(탭)
+    ("/stations", {"district": "가" * 51}),
+    ("/shortage-risk", {"district": "\t강남구"}),
+]
+
+
+# 범위 안 입력은 선언을 통과해 DB 단계에 닿는다(가짜 엔진이라 503). 경계값(2000-01-01, 2100-12-31,
+# 20자 대여소ID, 50자 자치구, 빈 자치구 문자열)도 통과해야 한다. 자치구 필터가 없는 요청과 /health는
+# 범위 선언과 상관없이 전처럼 DB 단계로 간다.
+IN_RANGE = [
+    ("/stations/ST-1", None),
+    ("/stations/" + "a1-" * 6 + "Z9", None),  # 20자
+    ("/predictions/ST-1", {"date": "2026-09-20"}),
+    ("/predictions/ST-1", {"date": "2000-01-01"}),
+    ("/predictions/ST-1", {"date": "2100-12-31"}),
+    ("/stations", {"district": "강남구"}),
+    ("/stations", {"district": "가" * 50}),
+    ("/stations", {"district": ""}),
+    ("/shortage-risk", {"district": "강남구"}),
+    ("/shortage-risk", None),
+    ("/health", None),
+]
+
+
+# 파라미터 id: 경로와 쿼리를 한 줄로(파이썬 repr). 비ASCII는 pytest가 알아서 이스케이프한다.
+def _case_id(case):
+    path, params = case
+    return path if params is None else f"{path}?{params}"
+
+
+@pytest.mark.parametrize(("path", "params"), OUT_OF_RANGE, ids=map(_case_id, OUT_OF_RANGE))
+def test_out_of_range_inputs_are_422_without_touching_the_database(probe, path, params):
+    """처리할 수 없는 값은 docs/api.md대로 422 JSON이고 DB를 조회하지 않는다(고치기 전 500)."""
+    engine, client = probe
+    response = client.get(path, params=params)
+    assert response.status_code == 422, (path, params, response.text)
+    assert response.headers["content-type"].startswith("application/json")
+    assert isinstance(response.json()["detail"], list)  # FastAPI 기본 {"detail": [...]} 형식
+    assert engine.calls == 0
+
+
+@pytest.mark.parametrize(("path", "params"), IN_RANGE, ids=map(_case_id, IN_RANGE))
+def test_in_range_inputs_reach_the_database(probe, path, params):
+    """범위 안 값(경계 포함)은 선언을 통과해 전처럼 DB를 조회한다(가짜 엔진이라 503)."""
+    engine, client = probe
+    response = client.get(path, params=params)
+    assert response.status_code == 503, (path, params, response.text)
+    assert response.json() == {"detail": "database unavailable"}
+    assert engine.calls == 1
+
+
+# 경로의 %00은 NUL 문자로 풀려 대여소ID 검증에 들어간다(인코딩된 글자 그대로 '%00'이 아님). 422
+# 본문의 input이 그 NUL 문자이고 오류 종류가 패턴 불일치인지 본다.
+def test_nul_in_path_is_decoded_and_rejected_by_the_pattern(probe):
+    _, client = probe
+    detail = client.get("/stations/%00").json()["detail"]
+    assert detail[0]["loc"] == ["path", "station_id"]
+    assert detail[0]["input"] == "\x00"
+    assert detail[0]["type"] == "string_pattern_mismatch"
+
+
+# 범위가 핸들러 안의 if문이 아니라 선언(Path·Query)이라 /openapi.json에도 드러난다: station_id 패턴,
+# district의 최대 길이·패턴. date의 ge·le는 OpenAPI 날짜 형식에 표현이 없어 docs/api.md에만 적는다.
+def test_input_ranges_are_declared_in_openapi(probe):
+    _, client = probe
+    paths = client.get("/openapi.json").json()["paths"]
+
+    def schema_of(path, name):
+        return next(p for p in paths[path]["get"]["parameters"] if p["name"] == name)["schema"]
+
+    for path in ("/stations/{station_id}", "/predictions/{station_id}"):
+        assert schema_of(path, "station_id")["pattern"] == main.STATION_ID_PATTERN
+    for path in ("/stations", "/shortage-risk"):
+        # str | None은 anyOf(string, null)로 나오므로 문자열 쪽 제약을 찾는다
+        string_schema = next(
+            s for s in schema_of(path, "district")["anyOf"] if s.get("type") == "string"
+        )
+        assert string_schema["maxLength"] == main.DISTRICT_MAX_LENGTH
+        assert string_schema["pattern"] == main.DISTRICT_PATTERN
