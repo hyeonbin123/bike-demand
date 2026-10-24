@@ -57,8 +57,8 @@ NOTE = "반납은 반영하지 않은 값"
 
 # 경로·쿼리 값의 범위. 핸들러 안의 if문이 아니라 Path·Query 선언으로 두어, FastAPI가 DB를 조회하기
 # 전에 422로 거르고(docs/api.md 공통) /openapi.json에도 같은 제약이 드러나게 한다.
-# - STATION_ID_PATTERN: 대여소ID는 영문자·숫자·하이픈 1~20자. stations.station_id가 varchar(20)이고
-#   저장된 값은 모두 'ST-숫자' 7자 이하다(docs/serving-schema.md). NUL(0x00)이 든 문자열은
+# - STATION_ID_PATTERN: 대여소ID는 영문자·숫자·하이픈 1~20자. stations.station_id는 varchar(20)에
+#   'ST-xxx' 형식이고(docs/serving-schema.md) 저장된 값은 모두 7자 이하다. NUL(0x00)이 든 문자열은
 #   PostgreSQL text에 들어갈 수 없어 psycopg가 DataError를 내는데, 이는 503 처리기가 잡는
 #   OperationalError가 아니라 500이 됐다. 선언으로 막으면 DB에 닿지 않는다
 # - DISTRICT_MAX_LENGTH·DISTRICT_PATTERN: 자치구 필터는 50자 이하(stations.district varchar(50)),
