@@ -509,3 +509,61 @@ def test_input_ranges_are_declared_in_openapi(probe):
         )
         assert string_schema["maxLength"] == main.DISTRICT_MAX_LENGTH
         assert string_schema["pattern"] == main.DISTRICT_PATTERN
+
+
+# ---------------------------------------------------------------------------------------------
+# 응답 압축(docs/api.md 공통). DB 없이 돈다.
+# [배경] 대시보드가 /stations 전체(대여소 약 3,000곳, JSON 수백 KB)와 /shortage-risk?limit=500을
+# 받는데 API에 압축이 없었다. main.py의 GZipMiddleware(minimum_size=1024)가 1 KB 이상 응답을 요청의
+# Accept-Encoding에 gzip이 있을 때만 압축한다. 정적 파일 쪽은 tests/test_api_dashboard.py.
+# ---------------------------------------------------------------------------------------------
+class StationRowsEngine:
+    """/stations 쿼리에 미리 정한 대여소 행을 돌려주는 가짜 엔진.
+
+    connect()·with 문·execute()·mappings()를 모두 자기 자신으로 받아, 실제 DB 없이 '대여소 수백
+    곳의 큰 JSON' 응답을 만든다. /stations 핸들러가 쓰는 호출 모양에만 맞춰 둔 것이다.
+    """
+
+    def __init__(self, rows):
+        self.rows = rows
+
+    def connect(self):
+        return self
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def execute(self, *args, **kwargs):
+        return self
+
+    def mappings(self):
+        return list(self.rows)
+
+
+# 대여소 300곳(JSON 약 30 KB)은 gzip을 받는 요청에 압축돼 오고(httpx가 풀어 준 JSON은 그대로 300곳),
+# 압축을 받지 않는 요청(identity)에는 그대로 온다. 두 본문은 같다. 1 KB 미만 응답(가짜 엔진의 503
+# JSON)은 gzip을 받더라도 압축하지 않는다.
+def test_large_json_is_gzipped_only_when_accepted(probe):
+    rows = [
+        {"station_id": f"ST-{i}", "station_no": i, "station_name": f"대여소 {i}",
+         "district": "강남구", "lat": 37.5, "lon": 127.0, "docks": 10}
+        for i in range(300)
+    ]  # fmt: skip
+    engine, client = probe
+    main.app.dependency_overrides[main.get_engine] = lambda: StationRowsEngine(rows)
+    compressed = client.get("/stations", headers={"Accept-Encoding": "gzip"})
+    assert compressed.status_code == 200
+    assert compressed.headers.get("content-encoding") == "gzip"
+    assert len(compressed.json()) == 300
+    plain = client.get("/stations", headers={"Accept-Encoding": "identity"})
+    assert "content-encoding" not in plain.headers
+    assert plain.json() == compressed.json()
+    assert compressed.num_bytes_downloaded < plain.num_bytes_downloaded
+
+    main.app.dependency_overrides[main.get_engine] = lambda: engine
+    small = client.get("/stations", headers={"Accept-Encoding": "gzip"})
+    assert small.status_code == 503 and small.json() == {"detail": "database unavailable"}
+    assert "content-encoding" not in small.headers

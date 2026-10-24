@@ -11,6 +11,7 @@ FastAPI 서비스(`src/bike_demand/api/`)가 지키는 요청·응답 형식. �
   - 503: 판단에 필요한 최신 데이터가 없음(`detail`에 무엇이 없는지)
   - DB에 접속하지 못하면(연결 실패, 연결 풀 대기 시간 초과) `/health`를 포함한 모든 요청이 503 `{"detail": "database unavailable"}`. 원인은 서버 로그에만 남긴다. 쿼리 오류 같은 그 밖의 서버 오류는 500
 - 인증 없음(읽기 전용 공개 데이터)
+- 응답 본문이 1 KB 이상이고 요청의 `Accept-Encoding`에 `gzip`이 있으면 gzip으로 압축해 보낸다(`Content-Encoding: gzip`, `Vary: Accept-Encoding`). 본문 내용은 같다. 대시보드 정적 파일(`/static/…`)도 같다
 
 ### 어느 예측을 쓰나 (모든 응답 공통)
 - `predictions`에는 예측 작업이 돌 때마다(단기예보 발표마다) 새 `model_version` 묶음이 쌓이고, 같은 시간을 여러 버전이 예측한다

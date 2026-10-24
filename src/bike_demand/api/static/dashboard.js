@@ -2,9 +2,9 @@
 // 지도 원, 대여소 표, 대여소별 6시간 막대를 그린다. 빌드 없이 index.html이 defer로 불러온다.
 // [설계] 즉시 실행 함수로 감싸 전역 변수를 만들지 않는다. 화면에 넣는 API 문자열은 모두 textContent로만 넣어
 // HTML로 해석되지 않게 한다(대여소 이름 등이 스크립트로 실행될 여지를 없앰, 커밋 8ec2fa3).
-// [흐름] 처음 열 때 initMap → refresh. refresh가 상태·자치구·부족 목록을 동시에 불러오고, 대여소를 고르면
-// selectStation이 상세를 불러온다. 조건을 빨리 바꿔도 이전 요청은 AbortController로 취소해 늦게 온 옛 응답이
-// 화면을 덮지 않게 한다.
+// [흐름] 처음 열 때 initMap → refresh. refresh가 상태·부족 목록을(자치구 목록은 페이지당 한 번만, 실패하면
+// 다음 새로고침에서 다시) 동시에 불러오고, 대여소를 고르면 selectStation이 상세를 불러온다. 조건을 빨리
+// 바꿔도 이전 요청은 AbortController로 취소해 늦게 온 옛 응답이 화면을 덮지 않게 한다.
 
 (() => {
   "use strict";
@@ -34,6 +34,10 @@
   let detailController = null;
   const markers = new Map();
   const rowButtons = new Map();
+  // 자치구 목록을 이미 받았는지. 자치구는 바뀌지 않는데 조건을 바꿀 때마다 /stations 전체(대여소 약 3,000곳,
+  // JSON 수백 KB)를 다시 받아 자치구만 뽑는 것은 낭비라, 페이지당 한 번만 받는다. 받기에 실패하거나 취소되면
+  // false로 남아 다음 새로고침에서 다시 시도한다(loadDistricts·refresh).
+  let districtsLoaded = false;
 
   // 요소를 만들고 글을 textContent로 넣는 도우미. innerHTML을 쓰지 않는 것이 이 파일의 보안 규칙이다.
   function element(tag, className, text) {
@@ -182,8 +186,9 @@
     }
   }
 
-  // /stations로 자치구 선택지를 다시 만든다. 지금 고른 자치구는 목록에 없더라도 남겨 선택이 풀리지 않게 하고,
-  // 한국어 순서로 정렬한다. 실패하면 현재 조건 그대로 조회하고 안내만 띄운다.
+  // /stations로 자치구 선택지를 만든다(성공하면 districtsLoaded를 켜 다시 받지 않음). 지금 고른 자치구는 목록에
+  // 없더라도 남겨 선택이 풀리지 않게 하고, 한국어 순서로 정렬한다. 실패하면 현재 조건 그대로 조회하고 안내만
+  // 띄운 뒤 다음 새로고침에서 다시 시도한다.
   async function loadDistricts(signal) {
     try {
       const stations = await request("/stations", signal);
@@ -202,6 +207,7 @@
       ui.district.value = selected;
       ui.district.disabled = false;
       ui["district-message"].textContent = "";
+      districtsLoaded = true;
     } catch (_) {
       if (!signal.aborted) ui["district-message"].textContent = "자치구 목록을 갱신하지 못했습니다. 현재 조건으로 조회하며 새로고침 시 다시 시도합니다.";
     }
@@ -348,8 +354,9 @@
     }
   }
 
-  // 조회 한 번: 이전 조회 취소 → 결과 비우기 → 새로고침 버튼 비활성 → 상태·자치구·부족 목록을 동시에 요청. 세
-  // 요청이 끝나고 이 조회가 취소되지 않았을 때만 버튼을 다시 켠다(더 새 조회가 버튼 상태를 맡음).
+  // 조회 한 번: 이전 조회 취소 → 결과 비우기 → 새로고침 버튼 비활성 → 상태·부족 목록(자치구 목록은 아직 못
+  // 받았을 때만)을 동시에 요청. 요청이 모두 끝나고 이 조회가 취소되지 않았을 때만 버튼을 다시 켠다(더 새 조회가
+  // 버튼 상태를 맡음).
   async function refresh() {
     queryController?.abort();
     queryController = new AbortController();
@@ -360,7 +367,11 @@
     ui["risk-status"].classList.remove("error");
     ui["risk-status"].textContent = "예측 정보를 불러오는 중입니다.";
     ui.refresh.disabled = true;
-    await Promise.all([loadHealth(signal), loadDistricts(signal), loadRisk(signal, hours, district)]);
+    await Promise.all([
+      loadHealth(signal),
+      districtsLoaded ? Promise.resolve() : loadDistricts(signal),
+      loadRisk(signal, hours, district),
+    ]);
     if (!signal.aborted) ui.refresh.disabled = false;
   }
 

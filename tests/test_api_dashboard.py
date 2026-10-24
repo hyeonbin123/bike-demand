@@ -11,7 +11,8 @@ import pytest
 from fastapi.testclient import TestClient
 
 # 앱과 DB 엔진 의존성. 엔진 의존성을 '부르면 실패'로 바꿔 정적 응답이 DB를 건드리지 않는지 본다.
-from bike_demand.api.main import app, get_engine
+# STATIC_DIR은 압축을 풀어 받은 본문을 원본 파일과 비교하는 데 쓴다.
+from bike_demand.api.main import STATIC_DIR, app, get_engine
 
 
 # HTML에서 <link href>와 <script src> 등의 경로 중 /static/으로 시작하는 로컬 파일만 모은다.
@@ -80,3 +81,26 @@ def test_static_mount_does_not_expose_python_or_mask_api_routes(static_client):
     assert "/" not in schema["paths"]
     assert {"/health", "/stations", "/stations/{station_id}", "/shortage-risk",
             "/predictions/{station_id}"} <= schema["paths"].keys()  # fmt: skip
+
+
+# 전송량: 1 KB 이상 응답은 요청에 Accept-Encoding: gzip이 있으면 gzip으로 압축해 보낸다(main.py의
+# GZipMiddleware, minimum_size=1024, docs/api.md 공통). 대시보드 JS(약 21 KB)가 압축되고 httpx가
+# 풀어 준 본문은 원본 파일과 같아야 한다. 받는 쪽이 압축을 받지 않겠다고 하면(identity) 그대로
+# 보내고, 1 KB 미만 응답(없는 정적 파일의 404 JSON)은 압축하지 않는다. Vary: Accept-Encoding은 중간
+# 캐시가 압축본과 원본을 섞지 않게 하는 헤더다.
+def test_static_files_are_gzipped_only_when_large_and_accepted(static_client):
+    source = (STATIC_DIR / "dashboard.js").read_bytes()
+    compressed = static_client.get("/static/dashboard.js", headers={"Accept-Encoding": "gzip"})
+    assert compressed.status_code == 200
+    assert compressed.headers.get("content-encoding") == "gzip"
+    assert "accept-encoding" in compressed.headers.get("vary", "").lower()
+    assert compressed.content == source  # httpx가 압축을 풀어 준 본문
+    assert compressed.num_bytes_downloaded < len(source)  # 실제로 받은 바이트는 원본보다 적다
+
+    plain = static_client.get("/static/dashboard.js", headers={"Accept-Encoding": "identity"})
+    assert "content-encoding" not in plain.headers
+    assert plain.content == source
+
+    small = static_client.get("/static/missing.js", headers={"Accept-Encoding": "gzip"})
+    assert small.status_code == 404
+    assert "content-encoding" not in small.headers

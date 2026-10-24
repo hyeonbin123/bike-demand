@@ -6,7 +6,7 @@
 
 # [파일 역할] 서비스의 HTTP 입구. FastAPI 앱 하나가 다섯 개 API(/health, /stations, /stations/{id},
 # /shortage-risk, /predictions/{id})와 대시보드 정적 파일을 제공한다. 데이터는 서비스용
-# Postgres에서만 읽고 쓰지 않는다.
+# Postgres에서만 읽고 쓰지 않는다. 1 KB 이상 응답은 받는 쪽이 허용하면 gzip으로 압축해 보낸다.
 # [핵심 규칙] (1) 한 응답 안에서는 예측 버전(model_version)을 하나만 쓴다: created_at이 가장 늦은
 # 묶음(latest_version). 예보 발표마다 새 묶음이 쌓여 같은 시간을 여러 버전이 예측하기 때문이다. (2)
 # 시각은 모두 KST로 돌려준다. (3) DB에 접속하지 못하면 모든 요청이 503 JSON. (4) 경로·쿼리 값의
@@ -26,12 +26,14 @@ from pathlib import Path
 from typing import Annotated
 
 # FastAPI: 경로·쿼리 검증(Path·Query의 범위를 벗어나면 422. fastapi.Path는 pathlib.Path와 이름이
-# 겹쳐 PathParam으로 바꿔 부름), 의존성 주입(Depends), 예외 처리기, 정적 파일 제공. pydantic
-# BaseModel: 응답 형식을 선언해 docs/api.md의 필드와 타입을 코드로 고정한다.
+# 겹쳐 PathParam으로 바꿔 부름), 의존성 주입(Depends), 예외 처리기, 정적 파일 제공, 응답
+# 압축(GZipMiddleware, Starlette 것). pydantic BaseModel: 응답 형식을 선언해 docs/api.md의 필드와
+# 타입을 코드로 고정한다.
 # SQLAlchemy Core의 select로 쿼리를 만든다. OperationalError(연결 실패·끊김)와 풀 대기 시간
 # 초과(TimeoutError, 내장 TimeoutError와 이름이 겹쳐 PoolTimeout으로 바꿔 부름)는 503 처리기에 쓴다.
 from fastapi import Depends, FastAPI, HTTPException, Query
 from fastapi import Path as PathParam
+from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -180,6 +182,12 @@ class Health(BaseModel):
 
 # uvicorn이 불러 가는 ASGI 앱 객체(bike_demand.api.main:app).
 app = FastAPI(title="bike-demand", version="0.1.0")
+
+# 응답 압축. 대시보드가 받는 /stations 전체(대여소 약 3,000곳, JSON 수백 KB)와
+# /shortage-risk?limit=500, 정적 JS가 크다. 요청의 Accept-Encoding에 gzip이 있을 때만 1 KB 이상
+# 응답을 압축하고(작은 JSON·오류 응답은 그대로) Vary: Accept-Encoding을 붙인다. 본문 내용은 바뀌지
+# 않으므로 API 계약(docs/api.md)은 그대로다. 압축 수준은 Starlette 기본값.
+app.add_middleware(GZipMiddleware, minimum_size=1024)
 
 
 # 앱 전체 DB 장애 처리기. 처음에는 /health만 DB 오류를 잡아 나머지 경로는 DB가 멈추면 글자로 된
