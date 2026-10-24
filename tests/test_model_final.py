@@ -5,25 +5,53 @@
 #   버전·후보·시각을 구분한다
 # - 서비스 학습 기간: warehouse 격자 끝(마지막 달 다음 달 1일)을 따르고, 달 중간에서 끝나면
 #   거부하며, --history-end는 조기 종료 앞에 학습할 달이 남는 달 첫날로 줄이는 것만 허용한다
+# - provenance: 서비스 학습은 커밋하지 않은 변경이 있는 작업 트리에서는 세대 폴더를 만들기 전에
+#   멈추고(allow_dirty일 때만 진행하며 변경을 기록), 세대의 serving.json에 코드 커밋·라이브러리
+#   버전·학습 설정·특징 순서·warehouse 지문·파일 SHA-256을 적는다. git이 없으면 이유만 적고 진행한다
 # [왜 중요한가] 프로젝트 측정 규칙의 'test는 고른 것 하나로 한 번만'을 코드로 강제하는 곳이다(README
 # 설계 판단). 서비스 쪽은 반기 갱신 뒤 재학습이 새 반기를 놓치거나(b72c9cc에서 고침), 잘못된
-# 기간으로 빈 세대 폴더를 남기는 일(90d35aa)을 막는다.
+# 기간으로 빈 세대 폴더를 남기는 일(90d35aa)을 막는다. provenance는 세대가 어느 코드·자료로
+# 만들어졌는지 증명하고 고정한 세대를 나중에 검증(provenance.verify_generation)하는 근거다.
 # [방식] 실제 LightGBM 학습 대신 fit_lightgbm_separate_stop을 가짜로 바꿔 기간과 행 수만 기록하고,
-# warehouse는 임시 DuckDB 파일로 만든다.
+# warehouse는 임시 DuckDB 파일로 만든다. git 명령은 주입한 가짜 함수로 흉내 내 개발 중 작업 트리
+# 상태에 흔들리지 않는다.
 
+import hashlib
 import json
 import math
 import threading
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 # final: 테스트 대상. artifacts·predict: 게시된 세대의 산출물을 다시 읽어 수준 특징이 채워지는지
-# 확인한다.
+# 확인한다. provenance: 가짜 git을 끼우고 게시된 세대를 검증한다. lightgbm: 기록된 버전과 비교.
 import duckdb
+import lightgbm as lgb
 import pytest
 
-from bike_demand.model import artifacts, final, predict
+from bike_demand.model import artifacts, final, predict, provenance
+from bike_demand.model.validate import PARAMS
 
 KST = timezone(timedelta(hours=9))
+COMMIT = "0123456789abcdef0123456789abcdef01234567"
+FAKE_DIFF = "diff --git a/src/x.py b/src/x.py\n+changed\n"
+
+
+# git 명령을 흉내 내는 실행 함수. status가 비어 있으면 깨끗한 작업 트리, root는 저장소 루트로 보고할
+# 경로(uv.lock·공휴일 시드를 찾는 기준)다.
+def fake_git(status: str = "", root: Path | None = None):
+    def run(args, cwd):
+        if args == ["rev-parse", "--show-toplevel"]:
+            return f"{(root or cwd).as_posix()}\n"
+        if args == ["rev-parse", "HEAD"]:
+            return COMMIT + "\n"
+        if args == ["status", "--porcelain"]:
+            return status
+        if args == ["diff", "HEAD"]:
+            return FAKE_DIFF
+        raise AssertionError(f"예상하지 않은 git 명령: {args}")
+
+    return run
 
 
 # 같은 예약 파일로 두 번째 시작은 '이미 시작된' SystemExit. 중단 뒤 모르고 다시 재는 것을 막는다.
@@ -151,18 +179,23 @@ def serving_warehouse(path, last_hour: str):
     return path
 
 
-# 모델 저장만 흉내 내는 가짜 LightGBM 모델.
+# 모델 저장과 특징 이름만 흉내 내는 가짜 LightGBM 모델(M3'의 특징 순서).
 class FakeBooster:
     def save_model(self, path):
         with open(path, "w", encoding="utf-8") as stream:
             stream.write("fake")
 
+    def feature_name(self):
+        return [*final.FEATURES, *final.LEVEL_FEATURES]
+
 
 # 실제 학습(수십 분~수 시간) 대신 조기 종료 시작 달과 최종 학습 행 수만 기록하는 가짜 학습 함수를
 # 끼운다. 기간 계산이 맞는지만 빠르게 본다. 학습 함수가 불리지 않으면 기록이 빈 사전으로 남는다.
+# git도 '깨끗한 작업 트리'를 돌려주는 가짜로 바꿔, 개발 중 실제 작업 트리의 변경 때문에 서비스
+# 학습이 거부되지 않게 한다(변경 있는 경우는 테스트가 git_run으로 직접 넘긴다).
 @pytest.fixture
 def fake_training(monkeypatch):
-    """학습 대신 최종 학습 행 수와 조기 종료 시작 달만 기록한다."""
+    """학습 대신 최종 학습 행 수와 조기 종료 시작 달만 기록한다. git은 깨끗한 가짜."""
     seen = {}
 
     def fit(load_stop_frame, load_full_frame, features, log, early_stop_from):
@@ -171,6 +204,7 @@ def fake_training(monkeypatch):
         return FakeBooster(), 1
 
     monkeypatch.setattr(final, "fit_lightgbm_separate_stop", fit)
+    monkeypatch.setattr(provenance, "run_git", fake_git())
     return seen
 
 
@@ -256,3 +290,117 @@ def test_serving_history_end_leaves_training_months_before_early_stopping(tmp_pa
     report = final.fit_serving(warehouse, selected_v3(tmp_path / "models"), "2023-04-01")
     assert list(report["history"]) == ["2023-01-01", "2023-04-01"]
     assert fake_training == {"stop_from": "2023-02-01", "rows": 2160}  # 2023-01~03 시간 수
+
+
+# --- provenance: 세대가 무엇으로 만들어졌는지 남기고, 변경 있는 작업 트리는 거부한다 --------------
+
+
+# 저장소 루트처럼 보이는 폴더: provenance가 지문을 남기는 uv.lock과 공휴일 시드를 둔다.
+def fake_repo(root: Path) -> Path:
+    (root / "dbt" / "seeds").mkdir(parents=True)
+    # write_text는 Windows에서 '\n'을 CRLF로 바꿔 쓰므로 바이트로 써서 지문 기대값과 맞춘다
+    (root / "uv.lock").write_bytes(b"lock\n")
+    (root / "dbt" / "seeds" / "kr_holidays.csv").write_bytes(b"date,name\n")
+    return root
+
+
+# 깨끗한 작업 트리(주입한 가짜 git)에서 서비스 학습을 하면 serving.json에 provenance 블록이 생긴다:
+# 주입한 커밋, 변경 없음, 저장소 파일(uv.lock·공휴일 시드) SHA-256, 라이브러리 버전, 학습
+# 설정(PARAMS), 모델의 특징 순서, warehouse 지문(2023~2026 격자 35,064행, 반기마다 시간당 1~8대라
+# 대여 합 157,896), 세대 파일(model.txt·artifacts/*) SHA-256. 파일에 적힌 블록은 반환값과 같다. 그
+# 세대를 같은 warehouse로 verify_generation 하면 특징 순서·번호표·파일 지문이 모두 통과한다.
+def test_serving_writes_provenance_from_the_injected_git_state(tmp_path, fake_training):
+    warehouse = serving_warehouse(tmp_path / "wh.duckdb", "2026-12-31 23:00:00")
+    out = selected_v3(tmp_path / "models")
+    root = fake_repo(tmp_path / "repo")
+    report = final.fit_serving(warehouse, out, git_run=fake_git(root=root))
+    record = report["provenance"]
+
+    _, directory = final.current_generation(out / "serving")
+    saved = json.loads((directory / "serving.json").read_text("utf-8"))
+    assert saved["provenance"] == json.loads(json.dumps(record, default=str))
+    assert record["git"] == {
+        "available": True,
+        "root": root.as_posix(),
+        "commit": COMMIT,
+        "dirty": False,
+        "changed_files": [],
+    }
+    assert record["repo_root"] == root.as_posix()
+    assert record["repo_files"] == {
+        "uv.lock": hashlib.sha256(b"lock\n").hexdigest(),
+        "dbt/seeds/kr_holidays.csv": hashlib.sha256(b"date,name\n").hexdigest(),
+    }
+    assert record["versions"]["lightgbm"] == lgb.__version__
+    assert set(record["versions"]) == {
+        "python",
+        "lightgbm",
+        "duckdb",
+        "numpy",
+        "pyarrow",
+        "holidays",
+    }
+    assert record["params"] == PARAMS
+    assert record["feature_names"] == [*final.FEATURES, *final.LEVEL_FEATURES]
+    warehouse_record = dict(record["warehouse"])
+    assert len(warehouse_record.pop("dim_stations_sha256")) == 64
+    assert warehouse_record == {
+        "history": ["2023-01-01", "2027-01-01"],
+        "grid_rows": 35064,
+        "grid_rentals": 157896,
+        "dim_stations_rows": 1,
+    }
+    assert set(record["files"]) == {
+        "model.txt",
+        "artifacts/halves.parquet",
+        "artifacts/meta.json",
+        "artifacts/profile.parquet",
+        "artifacts/stations.parquet",
+        "artifacts/system_halves.parquet",
+        "artifacts/trend.parquet",
+    }
+    assert record["files"]["model.txt"] == hashlib.sha256(b"fake").hexdigest()
+
+    con = duckdb.connect(str(warehouse), read_only=True)
+    try:
+        check = provenance.verify_generation(directory, FakeBooster(), con=con, strict=True)
+    finally:
+        con.close()
+    assert check["ok"] and check["has_provenance"] and check["features"]["match"]
+    assert check["codes"]["moved"] == 0 and check["codes"]["same"] == 1
+    assert check["files"]["compared"] == 7 and check["files"]["mismatched"] == []
+
+
+# 커밋하지 않은 변경이 있으면(수정 1개·새 파일 1개) allow_dirty 없이는 세대 폴더를 만들기 전에
+# 멈추고 학습도 하지 않는다. allow_dirty=True면 진행하되 변경 파일 목록과 diff의 SHA-256을
+# provenance에 남긴다.
+def test_serving_refuses_uncommitted_changes_before_creating_the_generation(
+    tmp_path, fake_training
+):
+    warehouse = serving_warehouse(tmp_path / "wh.duckdb", "2026-12-31 23:00:00")
+    out = selected_v3(tmp_path / "models")
+    dirty = fake_git(" M src/bike_demand/model/final.py\n?? new_file.py\n", root=tmp_path / "repo")
+    with pytest.raises(SystemExit, match="커밋하지 않은 변경"):
+        final.fit_serving(warehouse, out, git_run=dirty)
+    assert not (out / "serving").exists()
+    assert fake_training == {}
+
+    report = final.fit_serving(warehouse, out, allow_dirty=True, git_run=dirty)
+    git = report["provenance"]["git"]
+    assert git["dirty"] is True and git["commit"] == COMMIT
+    assert git["changed_files"] == [" M src/bike_demand/model/final.py", "?? new_file.py"]
+    assert git["diff_sha256"] == hashlib.sha256(FAKE_DIFF.encode("utf-8")).hexdigest()
+    assert fake_training["rows"] == 35064
+
+
+# git이 없는 환경(컨테이너)에서는 거부하지 않고 진행하며 provenance에 이유만 적는다. 저장소 파일
+# 지문은 현재 폴더 기준이라 없으면 None이다.
+def test_serving_continues_without_git_and_records_the_reason(tmp_path, fake_training):
+    def no_git(args, cwd):
+        raise FileNotFoundError("git")
+
+    warehouse = serving_warehouse(tmp_path / "wh.duckdb", "2026-12-31 23:00:00")
+    report = final.fit_serving(warehouse, selected_v3(tmp_path / "models"), git_run=no_git)
+    assert report["provenance"]["git"] == {"available": False, "reason": "FileNotFoundError: git"}
+    assert fake_training["rows"] == 35064
+    assert set(report["provenance"]["repo_files"]) == {"uv.lock", "dbt/seeds/kr_holidays.csv"}

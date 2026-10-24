@@ -10,8 +10,11 @@
    `serving/generations/<세대>/`에 모델·산출물·설명을 모두 쓴 뒤 `serving/CURRENT`(세대 이름
    한 줄)를 원자적으로 바꾼다(T28). 예측 작업은 CURRENT를 한 번 읽고 그 세대의 파일만 쓴다.
    기간 끝은 격자에서 정하므로 refresh_history로 새 반기를 넣은 뒤 다시 돌리면 그 반기까지 쓴다.
+   커밋하지 않은 변경이 있는 작업 트리에서는 세대 폴더를 만들기 전에 멈춘다(`--allow-dirty`로만
+   진행). serving.json의 `provenance`에 코드 커밋·라이브러리 버전·학습 설정·특징 순서·warehouse
+   지문·세대 파일 SHA-256을 적는다(model/provenance.py).
 
-실행: uv run python -m bike_demand.model.final test | serving
+실행: uv run python -m bike_demand.model.final test | serving [--allow-dirty]
 """
 
 # [파일 역할] 측정의 마지막 두 단계를 맡는다. (1) test: validation에서 고른 후보를 test 기간에서 딱
@@ -23,8 +26,8 @@
 # [현재 상태] v3 판정으로 M3'가 서비스 모델이고 게시된 세대는 v3-M3p-20260917T0904다(README,
 # docs/experiments.md). 서비스 학습은 이 PC에서 약 3시간 걸린다.
 # [연결] validate.py의 학습 함수(fit_lightgbm, fit_lightgbm_separate_stop)와
-# frames.py·metrics.py·artifacts.py를 쓴다. load_serving_model은 predict.py, forecast_gap.py,
-# shortage_eval.py가 부른다.
+# frames.py·metrics.py·artifacts.py를 쓴다. 세대의 provenance(코드 커밋·버전·지문)는 provenance.py가
+# 모은다. load_serving_model은 predict.py, forecast_gap.py, shortage_eval.py가 부른다.
 
 from __future__ import annotations
 
@@ -39,9 +42,10 @@ from pathlib import Path
 import duckdb
 import lightgbm as lgb
 
-# 프로젝트 모듈: 서비스 산출물, 특징·행 생성, 지표, 그리고 validate.py에 있는 LightGBM 학습
-# 절차(측정 때와 같은 고정 설정·조기 종료 방식을 그대로 쓰기 위해).
-from bike_demand.model import artifacts
+# 프로젝트 모듈: 서비스 산출물, 세대 provenance, 특징·행 생성, 지표, 그리고 validate.py에 있는
+# LightGBM 학습 절차(측정 때와 같은 고정 설정·조기 종료 방식을 그대로 쓰기 위해)와 그 설정(PARAMS,
+# provenance에 기록).
+from bike_demand.model import artifacts, provenance
 from bike_demand.model.frames import (
     FEATURES,
     LEVEL_FEATURES,
@@ -52,7 +56,7 @@ from bike_demand.model.frames import (
     shift_months,
 )
 from bike_demand.model.metrics import evaluate
-from bike_demand.model.validate import fit_lightgbm, fit_lightgbm_separate_stop
+from bike_demand.model.validate import PARAMS, fit_lightgbm, fit_lightgbm_separate_stop
 
 KST = timezone(timedelta(hours=9))
 # 사전 등록한 test 기간들(docs/experiments.md v1 데이터 나누기): test 때는
@@ -228,11 +232,33 @@ def _checked_history_end(value: str, latest: str) -> str:
 
 # 서비스 세대 하나를 학습해 게시한다. 기준선이 선택됐으면 LightGBM 모델이 없으므로 거부. v3 선택이면
 # v3 방법(asof_stations, 분리 조기 종료)을 그대로 따른다.
-def fit_serving(warehouse: Path, out_dir: Path, history_end: str | None = None) -> dict:
-    """history_end: 학습 기간 끝(제외). 기본은 warehouse 격자의 마지막 달 다음 달 1일."""
+# provenance: 작업 트리에 커밋하지 않은 변경이 있으면(추적하지 않는 새 파일 포함) allow_dirty 없이는
+# 세대 폴더를 만들기 전에 멈춘다. 어느 코드로 학습했는지 커밋 하나로 가리킬 수 없는 세대를 만들지
+# 않으려는 것이다. git이 없는 환경(컨테이너)에서는 멈추지 않고 이유만 기록한다. git_run은 테스트가
+# 가짜 git을 끼우는 자리다(기본 provenance.run_git).
+def fit_serving(
+    warehouse: Path,
+    out_dir: Path,
+    history_end: str | None = None,
+    allow_dirty: bool = False,
+    git_run: provenance.GitRunner | None = None,
+) -> dict:
+    """history_end: 학습 기간 끝(제외). 기본은 warehouse 격자의 마지막 달 다음 달 1일.
+
+    allow_dirty: 커밋하지 않은 변경이 있어도 진행한다(변경 파일 목록과 diff SHA-256이 provenance에
+    남음). 기본은 멈춤.
+    """
     selected, version = selected_model(out_dir)
     if selected not in CANDIDATE_FEATURES:
         raise SystemExit(f"기준선({selected})이 선택되어 서비스용 LightGBM 모델이 없음")
+    # 코드 상태를 먼저 본다. 변경이 있으면 warehouse도 열기 전에 멈춘다
+    git = provenance.git_state(run=git_run)
+    if git.get("dirty") and not allow_dirty:
+        changed = "\n".join(git["changed_files"])
+        raise SystemExit(
+            "작업 트리에 커밋하지 않은 변경이 있음. 커밋한 뒤 다시 실행하거나, 이 변경으로 학습한 "
+            f"세대라고 기록해도 되면 --allow-dirty를 준다:\n{changed}"
+        )
     levels = _uses_levels(selected)
     asof = version == "v3"
     features = CANDIDATE_FEATURES[selected]
@@ -261,10 +287,11 @@ def fit_serving(warehouse: Path, out_dir: Path, history_end: str | None = None) 
             con.close()
 
     # 서비스 예측이 쓸 산출물(번호표·패턴·추세·반기 수준)을 같은 학습 기간으로 먼저 세대 폴더에
-    # 저장한다.
+    # 저장한다. 같은 연결에서 학습 자료의 지문(격자 행 수·대여 합, 대여소 표 해시)도 뽑아 둔다.
     con = duckdb.connect(str(warehouse), read_only=True)
     try:
         meta = artifacts.export(con, history, target / "artifacts", with_levels=levels)
+        fingerprint = provenance.warehouse_fingerprint(con, history)
     finally:
         con.close()
     report: dict = {
@@ -296,8 +323,10 @@ def fit_serving(warehouse: Path, out_dir: Path, history_end: str | None = None) 
     report["seconds"] = round(time.perf_counter() - started, 1)
     report["training"] = log
     # 모델(model.txt)과 학습 보고(serving.json)를 세대 폴더에 쓴 뒤 마지막으로 CURRENT를 바꾼다. 이
-    # 순서라 예측 작업은 다 쓰인 세대만 본다.
+    # 순서라 예측 작업은 다 쓰인 세대만 본다. provenance는 모델 파일까지 쓴 뒤 모아야 세대 파일
+    # 지문(model.txt 포함)이 들어간다.
     booster.save_model(str(target / "model.txt"))
+    report["provenance"] = provenance.collect(target, booster, git, fingerprint, PARAMS)
     (target / "serving.json").write_text(
         json.dumps(report, ensure_ascii=False, indent=2, default=str), "utf-8"
     )
@@ -317,8 +346,8 @@ def load_serving_model(out_dir: Path) -> tuple[str, lgb.Booster, artifacts.Artif
 if __name__ == "__main__":
     import argparse
 
-    # 실행: python -m bike_demand.model.final test | serving [--history-end YYYY-MM-01]. 기본 출력
-    # 폴더는 data/models/v1(측정 결과 JSON과 serving/이 같이 있음).
+    # 실행: python -m bike_demand.model.final test | serving [--history-end YYYY-MM-01]
+    # [--allow-dirty]. 기본 출력 폴더는 data/models/v1(측정 결과 JSON과 serving/이 같이 있음).
     parser = argparse.ArgumentParser(description="test 한 번 측정과 서비스용 학습")
     parser.add_argument("step", choices=["test", "serving"])
     parser.add_argument("--warehouse", type=Path, default=Path("data/warehouse/bike_demand.duckdb"))
@@ -326,9 +355,15 @@ if __name__ == "__main__":
     parser.add_argument(
         "--history-end", help="serving 학습 기간 끝(제외) YYYY-MM-01, 기본은 격자 끝 다음 달"
     )
+    parser.add_argument(
+        "--allow-dirty",
+        action="store_true",
+        help="serving: 작업 트리에 커밋하지 않은 변경이 있어도 학습한다(변경 파일 목록과 diff의 "
+        "SHA-256이 세대 serving.json의 provenance에 남음). 기본은 멈춤",
+    )
     args = parser.parse_args()
     if args.step == "test":
         run_test(args.warehouse, args.out)
     else:
-        report = fit_serving(args.warehouse, args.out, args.history_end)
+        report = fit_serving(args.warehouse, args.out, args.history_end, args.allow_dirty)
         print(json.dumps(report, ensure_ascii=False, default=str))

@@ -13,7 +13,8 @@
 # 트리가 같은 대여소를 가리킨다. 대여소 패턴·추세·반기 수준도 학습 기간 정의 그대로여야 한다. 그래서
 # 학습 직후 frames.py와 같은 SQL(CTE)로 계산해 파일로 고정한다.
 # [연결] model/final.py가 서비스 학습 때 export를 부르고, load_serving_model이 load로 읽는다.
-# predict.py, forecast_gap.py, shortage_eval.py가 Artifacts를 받아 쓴다.
+# predict.py, forecast_gap.py, shortage_eval.py가 Artifacts를 받아 쓴다. warehouse_codes는
+# provenance.verify_generation이 고정한 번호표를 지금 warehouse의 번호와 대조할 때 쓴다.
 
 from __future__ import annotations
 
@@ -73,6 +74,22 @@ def export(
     }
     (out_dir / "meta.json").write_text(json.dumps(meta, ensure_ascii=False, indent=2), "utf-8")
     return meta
+
+
+# 지금 warehouse가 대여소마다 매기는 번호 {station_id: station_code}. 학습·내보내기와 같은
+# `frames.history_ctes`의 codes CTE(대여소ID 문자열 정렬 순위, 0부터)에서 읽어 규칙이 어긋날 수 없게
+# 한다. codes·district_codes CTE는 기간을 쓰지 않으므로 기간 인자는 빈 하루를 넘기고, 참조하지 않는
+# 다른 CTE(history, profile 등)는 실행되지 않는다. 같은 warehouse 빌드에서 만든 산출물의
+# stations.parquet와는 같고, 새 반기를 넣어 다시 빌드한 warehouse에서는 정렬 중간에 끼어든 새
+# 대여소만큼 뒤 번호가 밀린다(frames.history_ctes 주석). 호출 위치: provenance.verify_generation,
+# tests/test_model_provenance.py.
+def warehouse_codes(con: duckdb.DuckDBPyConnection) -> dict[str, int]:
+    """지금 dim_stations 기준 {station_id: station_code}. 학습 SQL과 같은 번호 규칙."""
+    rows = con.execute(
+        f"with {history_ctes(('1970-01-01', '1970-01-02'))} "
+        "select station_id, station_code from codes order by station_code"
+    ).fetchall()
+    return {station_id: int(code) for station_id, code in rows}
 
 
 # load가 돌려주는, 예측에 바로 쓰기 좋은 사전 묶음. profile 키는 (대여소, 쉬는 날 여부, 시각).
