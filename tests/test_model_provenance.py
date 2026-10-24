@@ -325,6 +325,16 @@ def test_file_digests_are_compared_with_the_record(two_year_warehouse, tmp_path)
     assert "serving.json" in provenance.file_digests(gen)
     assert provenance.verify_generation(gen, StubBooster(LEVELED))["files"]["compared"] == 7
 
+    # 세대 폴더 밖 manifest(scripts/generation_manifest.py의 {경로: {"sha256", "bytes"}} 형식,
+    # serving.json 포함)를 넘기면 serving.json까지 8개를 대조하고 통과한다
+    manifest_files = {
+        p: {"sha256": d, "bytes": (gen / p).stat().st_size}
+        for p, d in provenance.file_digests(gen).items()
+    }
+    assert "serving.json" in manifest_files and len(manifest_files) == 8
+    report = provenance.verify_generation(gen, StubBooster(LEVELED), expected=manifest_files)
+    assert report["ok"] and report["files"]["compared"] == 8 and report["files"]["unexpected"] == []
+
     # 파일이 바뀌거나 빠지면 이름으로 보고하고 strict면 멈춘다. 기록에 없는 파일은 경고
     meta_path = gen / "artifacts" / "meta.json"
     meta_path.write_text(json.dumps(json.loads(meta_path.read_text("utf-8"))), "utf-8")

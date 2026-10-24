@@ -217,7 +217,10 @@ def _read_record(directory: Path) -> dict:
 #     있으면 오류 — frames.load_frame으로 특징을 다시 만들면 이 모델에 맞지 않는 입력이 된다는
 #     뜻이다(산출물 경로 predict.feature_rows는 번호표를 쓰므로 영향 없음).
 # (iii) 파일 지문: expected(또는 serving.json의 provenance.files)와 지금 파일의 SHA-256. 다른 파일·
-#     빠진 파일은 오류, 기록에 없는 새 파일은 경고.
+#     빠진 파일은 오류, 기록에 없는 새 파일은 경고. expected는 {경로: SHA-256}이거나
+#     scripts/generation_manifest.py가 남기는 {경로: {"sha256", "bytes"}}다. 기록을 담는
+#     serving.json은 expected에 있을 때만(세대 폴더 밖 manifest) 대조하고, 없으면(세대 자신의
+#     provenance.files는 자기 지문을 가질 수 없음) 새 파일로도 치지 않는다.
 # strict=True면 오류가 하나라도 있을 때 GenerationMismatch(채점용: 멈추고 보고). 아니면 보고 사전만
 # 돌려준다(ok, problems, warnings). 호출 위치: scripts/generation_manifest.py, 고정 세대 채점,
 # tests.
@@ -225,7 +228,7 @@ def verify_generation(
     directory: Path,
     booster=None,
     con: duckdb.DuckDBPyConnection | None = None,
-    expected: dict[str, str] | None = None,
+    expected: dict[str, str | dict] | None = None,
     strict: bool = False,
 ) -> dict:
     """세대 폴더의 특징 순서·번호표·파일 지문 검사 보고. booster가 없으면 model.txt를 읽는다."""
@@ -292,10 +295,14 @@ def verify_generation(
     files: dict = {"checked": False}
     expected = expected if expected is not None else record.get("files")
     if expected is not None:
-        actual = file_digests(directory, exclude=(RECORD_FILE,))
+        # scripts/generation_manifest.py가 남긴 {경로: {"sha256", "bytes"}} 형식도 받는다
+        expected = {p: v["sha256"] if isinstance(v, dict) else v for p, v in expected.items()}
+        # 기록을 담는 serving.json은 기대값에 있을 때만 대조하고(세대 폴더 밖 manifest), 없으면
+        # 새 파일로도 치지 않는다(세대 자신의 provenance.files)
+        actual = file_digests(directory)
         mismatched = sorted(p for p in expected if p in actual and actual[p] != expected[p])
         missing_files = sorted(p for p in expected if p not in actual)
-        unexpected = sorted(p for p in actual if p not in expected)
+        unexpected = sorted(p for p in actual if p not in expected and p != RECORD_FILE)
         files = {
             "checked": True,
             "compared": len(expected),
