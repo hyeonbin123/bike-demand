@@ -369,3 +369,37 @@ def test_a_bad_value_skips_only_that_row_and_the_rest_of_the_day_loads(tmp_path,
     assert stored["realtime_snapshots"] == {("ST-2", at_10), ("ST-1", at_1010), ("ST-2", at_1010)}
     loaded = (bronze / "date=2026-09-29" / "loaded.txt").read_text(encoding="utf-8").split()
     assert loaded == ["100000.json", "101000.json"]
+
+
+# 위 시나리오를 실제 PostgreSQL(임시 DB)로 확인한다. 가짜 _insert_ignore가 아니라 실제 INSERT … ON
+# CONFLICT DO NOTHING 경로다: 10:00 실행은 ST-1 행만 건너뛰고 ST-2 스냅샷을 넣으며 대여소는 둘 다
+# 등록한다. 10:10 실행은 그날 Parquet 전체(10:00 포함)를 다시 적재해도 이미 있는 행은 건너뛰어
+# 10:10의 두 행만 더하고, 10:00의 같은 나쁜 행을 다시 건너뛴다(skipped_rows 1). 고치기 전에는 10:00
+# 실행부터 LoadFailed(원인 ValueError)였다.
+def test_a_bad_value_skips_only_that_row_with_the_real_database(pg_engine, tmp_path):
+    from bike_demand.serving.models import Station
+
+    raw, bronze = tmp_path / "raw", tmp_path / "bronze"
+    at_10 = datetime(2026, 9, 29, 10, 0, tzinfo=realtime.KST)
+    at_1010 = datetime(2026, 9, 29, 10, 10, tzinfo=realtime.KST)
+    poisoned = httpx.Client(transport=httpx.MockTransport(lambda r: bike_list(r, {"ST-1": "-"})))
+    normal = httpx.Client(transport=httpx.MockTransport(bike_list))
+
+    first = collect_realtime(pg_engine, raw, bronze, SECRET, at_10, poisoned)
+    second = collect_realtime(pg_engine, raw, bronze, SECRET, at_1010, normal)
+
+    counts = ("snapshots_inserted", "new_stations", "skipped_rows")
+    assert tuple(first[key] for key in counts) == (1, 2, 1)
+    assert tuple(second[key] for key in counts) == (2, 0, 1)
+    snapshot = RealtimeSnapshot
+    with pg_engine.connect() as conn:
+        snapshots = conn.execute(
+            select(snapshot.station_id, snapshot.fetched_at, snapshot.bike_count)
+        ).all()
+        stations = conn.execute(select(Station.station_id, Station.source, Station.docks)).all()
+    assert sorted((s, at.astimezone(realtime.KST), count) for s, at, count in snapshots) == [
+        ("ST-1", at_1010, 3),
+        ("ST-2", at_10, 3),
+        ("ST-2", at_1010, 3),
+    ]
+    assert sorted(stations) == [("ST-1", "realtime", 10), ("ST-2", "realtime", 10)]
