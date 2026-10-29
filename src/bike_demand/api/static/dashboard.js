@@ -5,6 +5,9 @@
 // [흐름] 처음 열 때 initMap → refresh. refresh가 상태·부족 목록을(자치구 목록은 페이지당 한 번만, 실패하면
 // 다음 새로고침에서 다시) 동시에 불러오고, 대여소를 고르면 selectStation이 상세를 불러온다. 조건을 빨리
 // 바꿔도 이전 요청은 AbortController로 취소해 늦게 온 옛 응답이 화면을 덮지 않게 한다.
+// [데모 시계] 서버가 BIKE_DEMAND_DEMO_NOW로 '지금'을 고정하면 /health의 demo_now에 그 시각이 온다. 그때는 본문
+// 맨 위에 '데모: 고정 시각 자료' 안내를 띄우고, 스냅샷 나이·막대 시작 시간을 기기 시계 대신 그 시각으로 잰다
+// (서버 응답과 같은 '지금'). demo_now가 null이면 전과 똑같이 기기 시계를 쓴다(docs/api.md '데모 시계').
 
 (() => {
   "use strict";
@@ -38,6 +41,10 @@
   // JSON 수백 KB)를 다시 받아 자치구만 뽑는 것은 낭비라, 페이지당 한 번만 받는다. 받기에 실패하거나 취소되면
   // false로 남아 다음 새로고침에서 다시 시도한다(loadDistricts·refresh).
   let districtsLoaded = false;
+  // 데모 시계(epoch 밀리초). /health의 demo_now가 있을 때만 숫자이고 아니면 null이다. 안내 상자는 처음 데모
+  // 시각을 받을 때 한 번만 만든다.
+  let demoNow = null;
+  let demoNotice = null;
 
   // 요소를 만들고 글을 textContent로 넣는 도우미. innerHTML을 쓰지 않는 것이 이 파일의 보안 규칙이다.
   function element(tag, className, text) {
@@ -50,6 +57,34 @@
   // ISO 시각 문자열을 'MM. DD. HH:MM:SS' 형태 KST로. 값이 없으면 '없음'.
   function stamp(value) {
     return value ? stampFormat.format(new Date(value)) : "없음";
+  }
+
+  // 화면이 '지금'으로 쓰는 시각(epoch 밀리초): 데모 시계가 켜져 있으면 그 시각, 아니면 기기 시계.
+  function clockNow() {
+    return demoNow ?? Date.now();
+  }
+
+  // /health의 demo_now를 반영한다. 값이 있으면 데모 시계를 그 시각으로 두고 본문 맨 위(main의 첫 자리)에 안내를
+  // 보인다. 실시간 화면으로 착각하지 않게 하려는 것이다. null이면 데모 시계를 끄고 안내를 숨긴다. 읽을 수 없는
+  // 시각 문자열도 꺼짐으로 본다(NaN으로 나이를 재지 않게). 글은 textContent·텍스트 노드로만 넣는다.
+  function applyDemoClock(value) {
+    const time = value ? new Date(value).getTime() : NaN;
+    demoNow = Number.isFinite(time) ? time : null;
+    if (demoNow === null) {
+      if (demoNotice) demoNotice.hidden = true;
+      return;
+    }
+    if (!demoNotice) {
+      demoNotice = element("aside", "notice");
+      document.querySelector("main").prepend(demoNotice);
+    }
+    const icon = element("span", "", "ⓘ");
+    icon.setAttribute("aria-hidden", "true");
+    const text = element("p");
+    text.append(element("strong", "", "데모: 고정 시각 자료"),
+      ` · 서버 시계가 ${stamp(value)} KST에 멈춰 있습니다. 실시간 정보가 아니라 그 시각에 저장해 둔 스냅샷과 예측입니다.`);
+    demoNotice.replaceChildren(icon, text);
+    demoNotice.hidden = false;
   }
 
   // 부족 대수 구간: 10대 이상 high, 5대 이상 medium, 그 밖 low. 범례·CSS 클래스·원 색이 이 구간을 함께 쓴다.
@@ -167,15 +202,16 @@
   }
 
   // /health에서 전체 대여소 중 가장 최근 수집 시각을 보여 준다. 30분보다 오래됐으면 경고한다(API의 스냅샷
-  // 나이 기본값 30분과 같은 기준).
+  // 나이 기본값 30분과 같은 기준). 나이는 clockNow() 기준이라 데모 시계가 켜져 있으면 그 시각으로 잰다.
   async function loadHealth(signal) {
     ui["snapshot-time"].textContent = "확인 중…";
     ui["health-message"].textContent = "";
     try {
       const data = await request("/health", signal);
       if (signal.aborted) return;
+      applyDemoClock(data.demo_now);
       ui["snapshot-time"].textContent = stamp(data.latest_snapshot_at);
-      const age = Date.now() - new Date(data.latest_snapshot_at).getTime();
+      const age = clockNow() - new Date(data.latest_snapshot_at).getTime();
       ui["health-message"].textContent = !data.latest_snapshot_at ? "아직 수집된 스냅샷이 없습니다."
         : age > 30 * 60 * 1000 ? "30분 이상 지난 정보입니다."
         : "전체 대여소 중 가장 최근 수집 시각";
@@ -312,12 +348,12 @@
 
   // 대여소 하나를 고르면: 이전 상세 요청 취소 → 표 행·지도 원 강조(aria-pressed) → 상세 영역을 불러오는
   // 중으로 바꾸고 제목에 포커스(화면 낭독기가 바뀐 곳을 읽게) → /stations/{id}를 불러 스냅샷·막대·버전 표시.
-  // 스냅샷이 30분보다 오래됐으면 함께 알린다.
+  // 스냅샷이 30분보다 오래됐으면 함께 알린다. 요청 시각은 clockNow()(데모 시계가 켜져 있으면 그 시각)다.
   async function selectStation(station) {
     detailController?.abort();
     detailController = new AbortController();
     const { signal } = detailController;
-    const requestedAt = Date.now();
+    const requestedAt = clockNow();
     for (const [id, entry] of rowButtons) {
       entry.row.classList.toggle("selected", id === station.station_id);
       entry.button.setAttribute("aria-pressed", String(id === station.station_id));

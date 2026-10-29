@@ -13,6 +13,12 @@ FastAPI 서비스(`src/bike_demand/api/`)가 지키는 요청·응답 형식. �
 - 인증 없음(읽기 전용 공개 데이터)
 - 응답 본문이 1 KB 이상이고 요청의 `Accept-Encoding`에 `gzip`이 있으면 gzip으로 압축해 보낸다(`Content-Encoding: gzip`, `Vary: Accept-Encoding`). 본문 내용은 같다. 대시보드 정적 파일(`/static/…`)도 같다
 
+### 데모 시계
+- 서버를 환경 변수 `BIKE_DEMAND_DEMO_NOW`(시간대가 있는 ISO 8601 시각, 예 `2026-09-19T18:11:00+09:00`, UTC면 끝에 `Z`)와 함께 띄우면 모든 응답의 '지금'이 그 시각으로 고정되고 흐르지 않는다: `/stations/{station_id}`의 '현재 시각이 든 시간', `/shortage-risk`의 스냅샷 나이 기준과 `generated_at`
+- 변수가 없거나 비어 있으면 실제 시각이다(기본 동작). 시간대가 없거나, 읽을 수 없거나, KST 날짜가 2000-01-01~2100-12-31 밖이면 서버가 시작하지 않는다(요청마다 오류를 내지 않고 시작 때 멈춤). 켜져 있으면 시작 로그에 WARNING으로 그 시각을 남긴다
+- `/health`의 `demo_now`가 그 시각(꺼져 있으면 `null`)이다. 대시보드는 이 값이 있으면 맨 위에 '데모: 고정 시각 자료' 안내를 띄우고, 스냅샷 나이와 대여소 상세의 시작 시간을 기기 시계 대신 이 시각으로 잰다
+- 데모 시계는 '지금'만 바꾼다. 최근 스냅샷과 쓸 예측 버전을 고르는 규칙에는 '지금 이전'이라는 상한이 없어, 그 시각 뒤의 자료가 든 DB(예: 수집을 계속한 개발 DB)에서는 그 뒤 자료가 골라진다. 그래서 그 시각까지의 자료만 든 빈 DB와 함께 쓴다: 고정 시각 데모 묶음(`scripts/build_demo_bundle.py`가 실시간 스냅샷 원본 하나·그때의 예보 발표 하나·대여소 표·서비스 모델로 만드는 Parquet 네 개 + `manifest.json`)을 `python -m bike_demand.serving.load demo --bundle <폴더>`로 넣는다. 이 적재는 `stations`·`realtime_snapshots`·`weather_forecasts`·`predictions`가 모두 빈 DB에만 한 트랜잭션으로 넣고, 하나라도 행이 있거나 묶음 파일의 SHA-256이 `manifest.json`과 다르면 아무것도 넣지 않는다
+
 ### 어느 예측을 쓰나 (모든 응답 공통)
 - `predictions`에는 예측 작업이 돌 때마다(단기예보 발표마다) 새 `model_version` 묶음이 쌓이고, 같은 시간을 여러 버전이 예측한다
 - **쓸 버전 = `created_at`이 가장 늦은 행의 `model_version`** (가장 최근에 만든 묶음). 같으면 `model_version` 문자열이 큰 것
@@ -29,10 +35,11 @@ FastAPI 서비스(`src/bike_demand/api/`)가 지키는 요청·응답 형식. �
 
 ## `GET /health`
 ```json
-{"status": "ok", "database": "ok", "latest_snapshot_at": "2026-09-17T08:10:03+09:00", "latest_prediction_hour": "2026-09-17T23:00:00+09:00"}
+{"status": "ok", "database": "ok", "latest_snapshot_at": "2026-09-17T08:10:03+09:00", "latest_prediction_hour": "2026-09-17T23:00:00+09:00", "demo_now": null}
 ```
 - DB에 접속하지 못하면 503 `{"detail": "database unavailable"}`
 - 스냅샷·예측이 하나도 없으면 해당 값은 `null`(상태는 `ok`)
+- `demo_now`: 데모 시계(위 '데모 시계')가 켜져 있으면 그 시각(KST), 꺼져 있으면 `null`. DB와 상관없는 서버 설정 값이다
 
 ## `GET /stations`
 쿼리: `district`(선택, 자치구 이름 정확히 일치. 50자 이하, 제어 문자 없음)

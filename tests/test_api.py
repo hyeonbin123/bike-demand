@@ -72,11 +72,13 @@ def add_predictions(engine, version, value, created_at, stations=("ST-1", "ST-2"
 
 # /health: 자료가 없으면 마지막 스냅샷·예측 시간이 null이고 상태는 ok. 자료를 넣으면 마지막 스냅샷
 # 시각과 최신 버전의 마지막 예측 시간이 KST(+09:00)로 나온다. 08시 + 15시간 = 23시가 마지막 예측
-# 시간이다.
-def test_health_without_data_and_with_data(client, pg_engine):
+# 시간이다. 데모 시계(환경 변수 BIKE_DEMAND_DEMO_NOW)는 꺼 두므로 demo_now는 null이다(켠 경우는
+# tests/test_demo.py).
+def test_health_without_data_and_with_data(client, pg_engine, monkeypatch):
+    monkeypatch.delenv(main.DEMO_NOW_ENV, raising=False)
     body = client.get("/health").json()
     assert body == {"status": "ok", "database": "ok", "latest_snapshot_at": None,
-                    "latest_prediction_hour": None}  # fmt: skip
+                    "latest_prediction_hour": None, "demo_now": None}  # fmt: skip
     add_stations(pg_engine)
     insert(
         pg_engine, RealtimeSnapshot, [{"station_id": "ST-1", "fetched_at": NOW, "bike_count": 1}]

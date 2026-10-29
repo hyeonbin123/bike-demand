@@ -2,6 +2,8 @@
 
 실행: uv run uvicorn bike_demand.api.main:app --port 8000
 현재 시각(get_now)과 DB 엔진(get_engine)은 의존성이라 테스트에서 바꿔 끼울 수 있다.
+환경 변수 BIKE_DEMAND_DEMO_NOW(시간대 있는 ISO 8601 시각)를 주면 '지금'을 그 시각으로 고정한다(데모
+시계). 잘못된 값이면 앱이 시작하지 않는다.
 """
 
 # [파일 역할] 서비스의 HTTP 입구. FastAPI 앱 하나가 다섯 개 API(/health, /stations, /stations/{id},
@@ -14,12 +16,18 @@
 # 문자열)은 DB에 닿기 전에 422다. 자세한 계약은 docs/api.md.
 # [설계 이유] 현재 시각과 DB 엔진을 FastAPI 의존성으로 주입해, 테스트가 시각을 고정하고 임시 DB를
 # 끼울 수 있게 했다(tests/test_api.py의 dependency_overrides).
+# [데모 시계] 서비스가 닫힌 뒤에는 실시간 스냅샷이 없어 /shortage-risk가 503이다. 저장해 둔 한
+# 시각의 자료(serving/load.py의 demo 적재)로 그때 화면을 다시 보려면 '지금'도 그 시각이어야 하므로,
+# 환경 변수가 있을 때만 get_now가 고정 시각을 돌려준다. 변수가 없으면 전과 똑같이 실제 시각이다.
 # [연결] api/shortage.py(부족 계산), serving/db.py(엔진), serving/models.py(테이블).
 # 대시보드(static/)는 이 API만 호출한다.
 
 from __future__ import annotations
 
 import logging
+import os
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from datetime import date, datetime, timedelta, timezone
 from functools import lru_cache
 from pathlib import Path
@@ -96,15 +104,69 @@ def get_engine() -> Engine:
     return _default_engine()
 
 
+# 데모 시계를 켜는 환경 변수 이름. 값은 시간대가 있는 ISO 8601 시각(예: 2026-09-19T18:11:00+09:00,
+# UTC면 끝에 Z)이다.
+DEMO_NOW_ENV = "BIKE_DEMAND_DEMO_NOW"
+
+
+# 데모 시계 값이 시각으로 읽히지 않거나 시간대가 없을 때의 예외. ValueError의 하위형이라 일반 값
+# 오류로도 잡힌다. 앱 시작(lifespan)에서 이 예외가 나면 uvicorn은 'Application startup failed'로
+# 끝난다.
+class DemoClockError(ValueError):
+    pass
+
+
+# BIKE_DEMAND_DEMO_NOW 값을 KST 시각으로 바꾼다. 없거나 빈 값(공백만 포함)이면 None(데모 시계 꺼짐).
+# docker compose의 '${VAR:-}'처럼 변수는 있지만 비어 있는 경우를 꺼짐으로 보려는 것이다.
+# 시간대가 없는 값(날짜만 준 값 포함)은 오류다: 서버 시간대로 짐작하면 컨테이너(UTC)와 PC(KST)에서
+# 9시간 다른 화면이 나온다. KST 날짜는 DATE_MIN~DATE_MAX 안이어야 한다(/predictions의 date 범위와
+# 같음): 그 밖의 극단 값(예: 9999-12-31)은 응답 계산(지금 + 6시간 등)에서 datetime 범위를 넘어 500이
+# 되므로 시작 때 막는다. 값은 설정이라 비밀이 아니므로 오류 메시지에 그대로(앞 80자) 넣는다.
+# 호출 위치: get_demo_now, scripts/build_demo_bundle.py(--demo-now), tests/test_demo.py.
+def parse_demo_now(raw: str | None) -> datetime | None:
+    """데모 시계 값(시간대 있는 ISO 8601) → KST datetime.
+
+    없거나 비면 None(꺼짐), 잘못된 값이면 DemoClockError.
+    """
+    if raw is None or not raw.strip():
+        return None
+    text_value = raw.strip()
+    try:
+        value = datetime.fromisoformat(text_value)
+        # 시간대가 없으면 astimezone이 PC 시간대로 짐작하므로 바꾸지 않고 오류로 보낸다. 1년 1월 1일
+        # 같은 끝 값은 KST로 옮길 때 OverflowError가 난다
+        local = value.astimezone(KST) if value.utcoffset() is not None else None
+    except (ValueError, OverflowError):
+        local = None
+    if local is None or not DATE_MIN <= local.date() <= DATE_MAX:
+        raise DemoClockError(
+            f"{DEMO_NOW_ENV}는 시간대가 있는 ISO 8601 시각({DATE_MIN}~{DATE_MAX} KST)이어야 함"
+            f"(예: 2026-09-19T18:11:00+09:00): {text_value[:80]!r}"
+        )
+    return local
+
+
+# 데모 시계 의존성: 환경 변수를 요청마다 읽어 고정 시각 또는 None을 돌려준다(읽기는 마이크로초
+# 단위라 캐시하지 않는다. 테스트가 monkeypatch로 변수를 바꾸면 바로 반영된다). /health가 이 값을
+# 그대로 낸다.
+def get_demo_now() -> datetime | None:
+    return parse_demo_now(os.environ.get(DEMO_NOW_ENV))
+
+
 # 현재 시각 의존성. 테스트가 고정 시각을 넣어 '지금부터 N시간', '30분 안 스냅샷' 같은 경계를
-# 재현한다.
+# 재현한다. 데모 시계가 켜져 있으면 그 시각이고 흐르지 않는다(모든 요청이 같은 순간을 본다).
+# 주의: 데모 시계는 '지금'만 바꾼다. 최근 스냅샷·예측 버전을 고르는 쿼리에는 '지금 이전' 상한이
+# 없어, 그 시각 뒤의 자료가 든 DB(예: 수집을 계속한 개발 DB)에서는 그 뒤 자료가 골라진다. 그래서 그
+# 시각까지의 자료만 넣은 빈 DB(serving/load.py demo)와 함께 쓴다(docs/api.md '데모 시계').
 def get_now() -> datetime:
-    return datetime.now(KST)
+    demo = get_demo_now()
+    return demo if demo is not None else datetime.now(KST)
 
 
 # 엔드포인트 인자 타입으로 쓰는 별칭. 함수 시그니처에 Depends를 반복해 적지 않으려는 것이다.
 EngineDep = Annotated[Engine, Depends(get_engine)]
 NowDep = Annotated[datetime, Depends(get_now)]
+DemoNowDep = Annotated[datetime | None, Depends(get_demo_now)]
 
 
 # 대여소 한 곳의 응답 형식(/stations 목록, /stations/{id}의 station). 실시간 스냅샷에만 있는
@@ -172,16 +234,32 @@ class DailyPredictions(BaseModel):
     hours: list[HourlyPrediction]
 
 
-# /health 응답: DB 상태, 마지막 스냅샷 시각, 고른 예측 버전의 마지막 예측 시간.
+# /health 응답: DB 상태, 마지막 스냅샷 시각, 고른 예측 버전의 마지막 예측 시간, 데모 시계(켜져
+# 있으면 고정 시각, 아니면 None). 대시보드가 demo_now로 데모 안내를 띄우고 스냅샷 나이를 그 시각
+# 기준으로 잰다.
 class Health(BaseModel):
     status: str
     database: str
     latest_snapshot_at: datetime | None
     latest_prediction_hour: datetime | None
+    demo_now: datetime | None
+
+
+# 앱 시작·종료 처리(lifespan). 시작할 때 데모 시계 값을 한 번 검사해, 잘못된 값이면 요청을 받기 전에
+# 서버가 멈추게 한다(요청마다 500이 나는 대신 설정 실수가 바로 드러남). 켜져 있으면 실시간 서비스로
+# 착각하지 않게 고정 시각을 WARNING으로 남긴다. 종료 때 할 일은 없다.
+@asynccontextmanager
+async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
+    demo = get_demo_now()
+    if demo is not None:
+        logger.warning(
+            "데모 시계 켜짐: 모든 '지금'을 %s로 고정 (%s)", demo.isoformat(), DEMO_NOW_ENV
+        )
+    yield
 
 
 # uvicorn이 불러 가는 ASGI 앱 객체(bike_demand.api.main:app).
-app = FastAPI(title="bike-demand", version="0.1.0")
+app = FastAPI(title="bike-demand", version="0.1.0", lifespan=lifespan)
 
 # 응답 압축. 대시보드가 받는 /stations 전체(대여소 약 3,000곳, JSON 수백 KB)와
 # /shortage-risk?limit=500, 정적 JS가 크다. 요청의 Accept-Encoding에 gzip이 있을 때만 1 KB 이상
@@ -250,9 +328,9 @@ def latest_version(conn, where=None) -> str | None:
 
 # 서비스 상태 확인. select 1로 DB 접속을 확인하고, 마지막 스냅샷 시각과 '고른 예측 버전의 마지막
 # 시간'을 돌려준다. 대시보드가 마지막 수집 시각을 여기서 가져온다. 스냅샷·예측이 없으면 해당 값만
-# null이고 상태는 ok다.
+# null이고 상태는 ok다. demo_now는 데모 시계(꺼져 있으면 null)로, DB와 상관없는 서버 설정 값이다.
 @app.get("/health", response_model=Health)
-def health(engine: EngineDep) -> Health:
+def health(engine: EngineDep, demo_now: DemoNowDep) -> Health:
     # DB 접속 실패는 다른 경로처럼 공통 처리기(database_unavailable)가 503으로 답하고 로그를 남긴다
     with engine.connect() as conn:
         conn.execute(text("select 1"))
@@ -268,6 +346,7 @@ def health(engine: EngineDep) -> Health:
         database="ok",
         latest_snapshot_at=_kst(snapshot) if snapshot else None,
         latest_prediction_hour=_kst(last_hour) if last_hour else None,
+        demo_now=demo_now,
     )
 
 
