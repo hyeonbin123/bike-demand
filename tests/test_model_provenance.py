@@ -233,6 +233,139 @@ def test_reappearing_station_keeps_artifact_values_on_the_artifact_path(
     assert float(frame["station_recent_mean"][st2_8h][0]) == 0.0
 
 
+# --- 산출물 경로 행렬의 번호 대조(고정 세대 채점의 번호 관문) ---------------------------------
+
+
+# 세대(ST-1 0번, ST-2 1번)를 만든 뒤 새 반기를 넣어 다시 빌드한 warehouse에 ST-15가 들어온 상황.
+# 산출물 경로 행렬(predict.feature_rows)은 번호 관문을 통과한다: 기존 두 곳은 산출물 번호, 새
+# 대여소는 max_station_code + 1 = 2이고 새 대여소 수·행 수를 보고한다. 같은 상황에서
+# verify_generation(con=다시 빌드한 warehouse)은 load_frame 번호가 밀린 곳(moved 1)을 문제로
+# 보므로 strict로 쓰면 멈춘다. 그래서 고정 세대 채점은 그 보고를 strict 없이 '보고만'
+# 쓰고(load_frame이었다면 밀렸을 번호 수), 특징 순서·파일 지문은 con 없이 strict로 확인한다.
+def test_artifact_path_rows_pass_the_code_check_after_a_rebuild(two_year_warehouse, tmp_path):
+    db = two_year_warehouse
+    db.execute("insert into dim_stations values ('ST-2', 2, '마포구', 12, 37.6, 126.9)")
+    db.execute("insert into int_station_hour_grid select 'ST-2', hour_start, 1 from dim_hours")
+    gen = tmp_path / "gen"
+    loaded = export_generation(db, gen)
+    db.execute("insert into dim_stations values ('ST-15', 15, '강남구', 8, 37.55, 127.05)")
+    stations = [
+        {"station_id": "ST-1"},
+        {"station_id": "ST-2"},
+        {"station_id": "ST-15", "district": "강남구", "docks": 8, "lat": 37.55, "lon": 127.05},
+    ]
+    matrix, keys = predict.feature_rows(stations, DAY_HOURS, WEATHER, loaded, LEVELED)
+    ids = [station_id for station_id, _ in keys]
+    codes = matrix[:, LEVELED.index("station_code")]
+
+    report = provenance.verify_feature_codes(loaded, ids, codes, strict=True)
+    assert report == {
+        "rows": 72,
+        "stations": 3,
+        "known_stations": 2,
+        "new_stations": 1,
+        "new_rows": 24,
+        "max_station_code": 1,
+        "new_code_range": [2, 2],
+        "invalid_rows": 0,
+        "mismatched": 0,
+        "mismatched_examples": [],
+        "new_in_training_range": 0,
+        "new_in_training_range_examples": [],
+        "multi_code_stations": 0,
+        "multi_code_examples": [],
+        "shared_codes": 0,
+        "shared_code_examples": [],
+        "problems": [],
+        "ok": True,
+    }
+    # 같은 다시 빌드한 warehouse: 번호표 대조는 load_frame 경로가 밀렸다고 보고한다(보고만)
+    rebuilt = provenance.verify_generation(gen, StubBooster(LEVELED), con=db)
+    assert not rebuilt["ok"] and rebuilt["codes"]["moved"] == 1
+    assert rebuilt["codes"]["new"] == 1 and rebuilt["codes"]["new_with_reused_code"] == 1
+    # 특징 순서·파일 지문만 보는 strict 검사(con 없음)는 통과한다
+    expected = provenance.file_digests(gen)
+    assert provenance.verify_generation(gen, StubBooster(LEVELED), expected=expected, strict=True)[
+        "ok"
+    ]
+
+
+# load_frame 번호(다시 빌드한 warehouse의 문자열 정렬 순위: ST-1 0, ST-15 1, ST-2 2)로 만든 행은
+# 관문에 걸린다: ST-2는 산출물 번호 1이 아니라 2이고, 새 대여소 ST-15는 학습 번호 범위 안의 1을
+# 받았다(학습 때 ST-2의 범주). strict면 GenerationMismatch로 멈춘다.
+def test_load_frame_numbering_fails_the_code_check(two_year_warehouse, tmp_path):
+    db = two_year_warehouse
+    db.execute("insert into dim_stations values ('ST-2', 2, '마포구', 12, 37.6, 126.9)")
+    db.execute("insert into int_station_hour_grid select 'ST-2', hour_start, 1 from dim_hours")
+    loaded = export_generation(db, tmp_path / "gen")
+    db.execute("insert into dim_stations values ('ST-15', 15, '강남구', 8, 37.55, 127.05)")
+    shifted = artifacts.warehouse_codes(db)
+    assert shifted == {"ST-1": 0, "ST-15": 1, "ST-2": 2}
+    ids = [station_id for station_id in shifted for _ in range(24)]
+    codes = np.array([shifted[station_id] for station_id in ids], dtype=np.float32)
+
+    report = provenance.verify_feature_codes(loaded, ids, codes)
+    assert not report["ok"]
+    assert (report["mismatched"], report["mismatched_examples"]) == (1, [["ST-2", 1, [2]]])
+    assert report["new_in_training_range"] == 1
+    assert report["new_in_training_range_examples"] == [["ST-15", [1]]]
+    assert (report["new_stations"], report["new_rows"], report["new_code_range"]) == (1, 24, [1, 1])
+    assert len(report["problems"]) == 2
+    with pytest.raises(provenance.GenerationMismatch, match="번호"):
+        provenance.verify_feature_codes(loaded, ids, codes, strict=True)
+
+
+# feature_rows는 새 대여소 번호를 호출마다 넘긴 목록 순서로 다시 매긴다. 평가 기간을 달 단위로 나눠
+# 부르며 달마다 새 대여소 구성이 다르면, 합친 행렬에서 한 대여소가 번호 둘을 갖거나(ST-15: 1과 2) 두
+# 대여소가 한 번호를 나눠 쓴다(1: ST-15와 ST-16). 관문은 둘 다 문제로 보고한다. 이 warehouse의 학습
+# 번호는 ST-1의 0 하나라 새 대여소는 1부터 받는다.
+def test_new_station_codes_must_stay_fixed_across_calls(two_year_warehouse, tmp_path):
+    loaded = export_generation(two_year_warehouse, tmp_path / "gen")
+    assert loaded.max_station_code == 0
+
+    def new(station_id):
+        return {"station_id": station_id, "district": "강남구", "docks": 8, "lat": 37.5, "lon": 127}
+
+    first, first_keys = predict.feature_rows(
+        [{"station_id": "ST-1"}, new("ST-15")], DAY_HOURS, WEATHER, loaded, LEVELED
+    )
+    second, second_keys = predict.feature_rows(
+        [new("ST-16"), new("ST-15")], DAY_HOURS, WEATHER, loaded, LEVELED
+    )
+    code = LEVELED.index("station_code")
+    ids = [s for s, _ in first_keys] + [s for s, _ in second_keys]
+    codes = np.concatenate([first[:, code], second[:, code]])
+
+    report = provenance.verify_feature_codes(loaded, ids, codes)
+    assert not report["ok"]
+    assert report["multi_code_stations"] == 1
+    assert report["multi_code_examples"] == [["ST-15", [1, 2]]]
+    assert report["shared_codes"] == 1
+    assert report["shared_code_examples"] == [[1, ["ST-15", "ST-16"]]]
+    assert (report["new_stations"], report["new_rows"], report["new_code_range"]) == (2, 72, [1, 2])
+    assert report["mismatched"] == 0 and report["new_in_training_range"] == 0
+
+    # 한 호출로 만들면(또는 새 대여소 번호를 미리 하나로 정해 두면) 통과한다
+    once, once_keys = predict.feature_rows(
+        [{"station_id": "ST-1"}, new("ST-15"), new("ST-16")], DAY_HOURS, WEATHER, loaded, LEVELED
+    )
+    ok = provenance.verify_feature_codes(loaded, [s for s, _ in once_keys], once[:, code])
+    assert ok["ok"] and ok["new_code_range"] == [1, 2]
+
+
+# 번호 열이 정수가 아닌 행(NaN·무한·소수)은 따로 세어 문제로 보고하고, 대여소ID 수와 번호 수가
+# 다르면 짝을 지을 수 없어 ValueError다.
+def test_code_check_reports_invalid_codes_and_refuses_unequal_lengths(two_year_warehouse, tmp_path):
+    loaded = export_generation(two_year_warehouse, tmp_path / "gen")
+    ids = ["ST-1", "ST-1", "ST-1", "ST-1"]
+    report = provenance.verify_feature_codes(loaded, ids, [0.0, float("nan"), float("inf"), 0.5])
+    assert report["invalid_rows"] == 3 and not report["ok"]
+    assert report["mismatched"] == 0 and report["known_stations"] == 1
+    assert any("정수" in problem for problem in report["problems"])
+    with pytest.raises(ValueError):
+        provenance.verify_feature_codes(loaded, ids, [0.0, 0.0])
+
+
 # warehouse_codes는 frames.history_ctes의 codes CTE와 같은 규칙(대여소ID 문자열 정렬 순위,
 # 0부터)이다. load_frame이 준 번호와 거치대 수의 짝으로 같은 번호 규칙인지 확인한다.
 def test_warehouse_codes_follow_the_load_frame_numbering(small_warehouse):

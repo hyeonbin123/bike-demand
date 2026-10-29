@@ -4,12 +4,14 @@
 커밋과 작업 트리 변경, 저장소 파일(uv.lock, 공휴일 시드) SHA-256, 파이썬·라이브러리 버전, 학습 설정,
 모델의 특징 순서, warehouse 지문, 세대 파일 SHA-256. `verify_generation`은 그 기록과 지금
 상태(저장한 모델, 산출물 meta, 지금 warehouse의 대여소 번호, 파일)를 대조한다.
+`verify_feature_codes`는 고정 세대로 채점할 특징 행렬의 대여소 번호를 세대 번호표와 대조한다.
 """
 
-# [파일 역할] 두 가지다. (1) collect·git_state·warehouse_fingerprint·package_versions·file_digests:
+# [파일 역할] 세 가지다. (1) collect·git_state·warehouse_fingerprint·package_versions·file_digests:
 # 서비스 세대를 만들 때 '이 세대는 이 커밋·이 라이브러리·이 자료로 나왔다'를 남긴다. (2)
 # verify_generation: 고정한 세대를 나중의 warehouse에서 예측·채점하기 전에 입력이 학습 때와 같은지
-# 확인하는 관문이다.
+# 확인하는 관문이다. (3) verify_feature_codes: 산출물 경로(predict.feature_rows)로 만든 채점 행렬의
+# 번호 열이 세대 번호표와 맞는지 행 단위로 확인하는 번호 관문이다.
 # [왜 필요한가] 세대 폴더(data/ 아래, 커밋되지 않음)를 잃으면 같은 바이트로 다시 만들 수 없고(학습
 # 행 순서가 실행마다 달라 재학습이 같은 모델이라는 보장이 없음), 남아 있어도 어느 코드로 학습했는지
 # 기록이 없었다. 또 범주형 특징 station_code는 frames.history_ctes가 '지금 warehouse의 대여소ID
@@ -18,8 +20,8 @@
 # 번호표(artifacts의 stations.parquet)를 써야 하고, 번호가 밀렸는지는 코드가 확인해야
 # 한다(tests/test_model_provenance.py의 회귀 테스트가 밀림과 대조를 재현한다).
 # [연결] model/final.py fit_serving이 git_state → (학습) → collect를 부른다. verify_generation은
-# scripts/generation_manifest.py와 고정 세대 채점 코드가 부른다. artifacts.warehouse_codes가 번호
-# 대조의 warehouse 쪽이다.
+# scripts/generation_manifest.py와 고정 세대 채점 코드가, verify_feature_codes는 고정 세대 채점
+# 코드가 부른다. artifacts.warehouse_codes가 번호 대조의 warehouse 쪽이다.
 # [주의] git 호출은 주입할 수 있는 함수(run)로 두어 테스트가 실제 작업 트리에 흔들리지 않는다. git이
 # 없는 환경(컨테이너)에서는 값 대신 이유를 적고 멈추지 않는다.
 
@@ -29,15 +31,17 @@ import hashlib
 import json
 import platform
 import subprocess
+from collections import Counter, defaultdict
 from collections.abc import Callable, Iterable
 from datetime import datetime, timedelta, timezone
 from importlib import metadata
 from pathlib import Path
 
 # duckdb: warehouse 지문(격자 행 수·대여 합, 대여소 표 해시)을 읽기 전용 연결로 뽑는다. lightgbm:
-# booster를 넘기지 않았을 때 세대 폴더의 model.txt를 읽는다.
+# booster를 넘기지 않았을 때 세대 폴더의 model.txt를 읽는다. numpy: 특징 행렬의 번호 열을 검사한다.
 import duckdb
 import lightgbm as lgb
+import numpy as np
 
 # artifacts: 세대 산출물(번호표·meta)을 읽고 지금 warehouse의 번호를 같은 규칙으로 매긴다.
 from bike_demand.model import artifacts
@@ -215,7 +219,10 @@ def _read_record(directory: Path) -> dict:
 #     대여소(new), warehouse에서 사라진 대여소(missing), 새 대여소가 학습 때 번호 범위 안의 번호를
 #     받은 수(new_with_reused_code: load_frame 경로였다면 남의 범주를 타는 곳). moved가 하나라도
 #     있으면 오류 — frames.load_frame으로 특징을 다시 만들면 이 모델에 맞지 않는 입력이 된다는
-#     뜻이다(산출물 경로 predict.feature_rows는 번호표를 쓰므로 영향 없음).
+#     뜻이다(산출물 경로 predict.feature_rows는 번호표를 쓰므로 영향 없음). 그래서 산출물 경로로
+#     채점하는 쪽은 이 보고를 strict 없이 '보고만'(load_frame이었다면 밀렸을 번호 수) 쓰고, 행렬의
+#     실제 번호는 verify_feature_codes로 확인한다(다시 빌드한 warehouse에서는 moved가 나와 strict면
+#     반드시 멈춤).
 # (iii) 파일 지문: expected(또는 serving.json의 provenance.files)와 지금 파일의 SHA-256. 다른 파일·
 #     빠진 파일은 오류, 기록에 없는 새 파일은 경고. expected는 {경로: SHA-256}이거나
 #     scripts/generation_manifest.py가 남기는 {경로: {"sha256", "bytes"}}다. 기록을 담는
@@ -329,4 +336,117 @@ def verify_generation(
     }
     if strict and problems:
         raise GenerationMismatch(f"{directory.name}: " + "; ".join(problems))
+    return report
+
+
+# 고정한 세대로 나중의 자료를 채점할 때(산출물 경로: predict.feature_rows로 만든 특징 행렬), 행렬의
+# station_code 열이 세대 번호표와 맞는지 행 단위로 대조하는 번호 관문이다.
+# - 산출물 번호표(stations.parquet)에 있는 대여소는 모든 행의 번호가 산출물 번호와 같아야 한다
+#   (mismatched).
+# - 번호표에 없는 새 대여소는 학습 번호 범위 밖, 곧 max_station_code보다 큰 번호여야 한다
+#   (new_in_training_range: 범위 안이면 학습 때 다른 대여소의 범주를 탄다).
+# - 행렬 전체에서 대여소 하나에 번호 하나, 번호 하나에 대여소 하나여야 한다(multi_code_stations,
+#   shared_codes). feature_rows는 새 대여소 번호를 호출마다 넘긴 목록 순서로 다시 매기므로, 평가
+#   기간을 달 단위로 나눠 부르며 달마다 새 대여소 구성이 다르면 여기서 걸린다. 그래서 나눠 만든
+#   행렬은 합친 배열로 한 번에 넘긴다.
+# - 번호 열이 정수가 아닌 행(NaN·무한·소수)은 invalid_rows로 세고 문제로 본다.
+# 보고에는 새 대여소 수·행 수·새 번호 범위를 남긴다(결과 기록용).
+# verify_generation과 나눈 이유: verify_generation의 번호표 대조(con)는 지금 warehouse가 매기는
+# 번호(frames.load_frame 경로)를 보므로, 새 반기를 넣어 다시 빌드한 warehouse에서는 산출물 경로가
+# 맞게 동작해도 moved(밀린 곳)가 나와 strict면 반드시 멈춘다. 산출물 경로 채점은 그 보고를 strict
+# 없이 '보고만'(load_frame이었다면 밀렸을 번호 수) 쓰고, 특징 순서·파일 지문은 con 없이 strict로
+# 확인하고, 실제 입력 번호는 이 함수로 확인한다.
+# 입력: loaded(artifacts.load 결과), station_ids(행마다 대여소ID; feature_rows가 돌려준 keys의 첫
+# 값), codes(행마다 번호; 행렬의 booster.feature_name().index("station_code") 열). 길이가 다르면
+# ValueError. strict=True면 문제가 하나라도 있을 때 GenerationMismatch. 호출 위치: 고정 세대 채점,
+# tests/test_model_provenance.py.
+def verify_feature_codes(
+    loaded: artifacts.Artifacts,
+    station_ids: Iterable[str],
+    codes: Iterable[float],
+    strict: bool = False,
+) -> dict:
+    """특징 행렬의 station_code 열을 세대 번호표와 대조한 보고.
+
+    키: rows·stations·known_stations·new_stations·new_rows·new_code_range, 문제별 수와 예,
+    problems, ok.
+    """
+    fixed = {sid: int(row["station_code"]) for sid, row in loaded.stations.items()}
+    ids = list(station_ids)
+    values = np.asarray(codes, dtype=np.float64).reshape(-1)
+    if len(ids) != len(values):
+        raise ValueError(f"대여소ID {len(ids)}개와 번호 {len(values)}개의 수가 다름")
+    valid = np.isfinite(values) & (values == np.floor(values))
+    # (대여소ID, 번호) 짝마다 행 수. 정수가 아닌 번호의 행은 짝에 넣지 않고 따로 센다.
+    pairs = Counter(
+        (sid, int(code))
+        for sid, code, ok in zip(ids, values.tolist(), valid.tolist(), strict=True)
+        if ok
+    )
+    codes_by_station: dict[str, set[int]] = defaultdict(set)
+    stations_by_code: dict[int, set[str]] = defaultdict(set)
+    rows_by_station: Counter[str] = Counter()
+    for (sid, code), count in pairs.items():
+        codes_by_station[sid].add(code)
+        stations_by_code[code].add(sid)
+        rows_by_station[sid] += count
+    stations = set(ids)
+    new = sorted(sid for sid in stations if sid not in fixed)
+    mismatched = [
+        [sid, fixed[sid], sorted(codes_by_station[sid])]
+        for sid in sorted(codes_by_station)
+        if sid in fixed and codes_by_station[sid] != {fixed[sid]}
+    ]
+    in_range = [
+        [sid, sorted(codes_by_station[sid])]
+        for sid in new
+        if codes_by_station[sid] and min(codes_by_station[sid]) <= loaded.max_station_code
+    ]
+    multi = [
+        [sid, sorted(found)] for sid, found in sorted(codes_by_station.items()) if len(found) > 1
+    ]
+    shared = [
+        [code, sorted(sids)] for code, sids in sorted(stations_by_code.items()) if len(sids) > 1
+    ]
+    new_codes = sorted({code for sid in new for code in codes_by_station[sid]})
+    invalid = int((~valid).sum())
+
+    problems: list[str] = []
+    if invalid:
+        problems.append(f"station_code가 정수가 아닌 행 {invalid}개(NaN·무한·소수)")
+    if mismatched:
+        problems.append(
+            f"산출물 번호표와 번호가 다른 대여소 {len(mismatched)}곳(예: {mismatched[:3]})"
+        )
+    if in_range:
+        problems.append(
+            f"학습 번호 범위(max_station_code {loaded.max_station_code} 이하)의 번호를 받은 새 "
+            f"대여소 {len(in_range)}곳(예: {in_range[:3]})"
+        )
+    if multi:
+        problems.append(f"번호가 둘 이상인 대여소 {len(multi)}곳(예: {multi[:3]})")
+    if shared:
+        problems.append(f"둘 이상의 대여소가 쓰는 번호 {len(shared)}개(예: {shared[:3]})")
+    report = {
+        "rows": len(ids),
+        "stations": len(stations),
+        "known_stations": len(stations) - len(new),
+        "new_stations": len(new),
+        "new_rows": sum(rows_by_station[sid] for sid in new),
+        "max_station_code": loaded.max_station_code,
+        "new_code_range": [new_codes[0], new_codes[-1]] if new_codes else None,
+        "invalid_rows": invalid,
+        "mismatched": len(mismatched),
+        "mismatched_examples": mismatched[:10],
+        "new_in_training_range": len(in_range),
+        "new_in_training_range_examples": in_range[:10],
+        "multi_code_stations": len(multi),
+        "multi_code_examples": multi[:10],
+        "shared_codes": len(shared),
+        "shared_code_examples": shared[:10],
+        "problems": problems,
+        "ok": not problems,
+    }
+    if strict and problems:
+        raise GenerationMismatch("특징 행렬의 대여소 번호: " + "; ".join(problems))
     return report
