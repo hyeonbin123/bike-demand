@@ -11,6 +11,7 @@
 # (docs/serving-schema.md 적재 규칙).
 
 import logging
+import time
 from datetime import date, datetime, timedelta, timezone
 
 # duckdb: 작은 warehouse 파일(dim_stations만) 만들기. pyarrow: ingest 모듈의 SCHEMA(모든 열
@@ -28,12 +29,41 @@ from bike_demand.serving.models import RealtimeSnapshot, Station, WeatherForecas
 KST = timezone(timedelta(hours=9))
 
 
-# 실시간 API 이름 '102. 망원역 1번출구 앞'은 번호 102와 이름으로 나누고, 번호가 없으면 이름만, 값이
-# 없으면 둘 다 None.
-def test_split_station_name():
-    assert load.split_station_name("102. 망원역 1번출구 앞") == (102, "망원역 1번출구 앞")
-    assert load.split_station_name("이름만") == (None, "이름만")
-    assert load.split_station_name(None) == (None, None)
+# 실시간 API 이름 '102. 망원역 1번출구 앞'은 번호 부분 '102'(숫자 문자열 그대로, 정수 변환은
+# realtime_rows가 함)와 이름으로 나누고, 번호가 없으면 이름만, 값이 없으면 둘 다 None. 나누는 규칙은
+# 예전 정규식 `^\s*(\d+)\.\s*(.*?)\s*$`와 같다: 앞뒤 공백(줄바꿈 포함)은 떼고, 이름 부분 가운데에
+# 줄바꿈이 있으면 번호 없는 이름으로 본다. 앞의 0과 전각 숫자는 그대로 둔다.
+@pytest.mark.parametrize(
+    "name, expected",
+    [
+        ("102. 망원역 1번출구 앞", ("102", "망원역 1번출구 앞")),
+        ("이름만", (None, "이름만")),
+        (None, (None, None)),
+        ("", (None, None)),
+        ("   ", (None, "")),
+        ("  7.  ", ("7", "")),
+        ("01653. 노원역1번출구", ("01653", "노원역1번출구")),
+        ("１２. 전각 숫자", ("１２", "전각 숫자")),
+        ("1.2. 점이 둘", ("1", "2. 점이 둘")),
+        ("1 . 점 앞 공백", (None, "1 . 점 앞 공백")),
+        ("\n1.\n이름\n", ("1", "이름")),
+        ("1. 가운데\n줄바꿈", (None, "1. 가운데\n줄바꿈")),
+        ("1. a\r\nb", (None, "1. a\r\nb")),
+    ],
+)
+def test_split_station_name(name, expected):
+    assert load.split_station_name(name) == expected
+
+
+# 이름 가운데의 긴 공백은 시간이 길이에 비례해야 한다. 예전 정규식 `(.*?)\s*$`는 공백 4만 개에
+# 약 12초(길이의 제곱에 비례, 1만 6천 개에 2.2초를 이 PC에서 잼)가 걸려, 그런 이름 하나가 그날
+# 적재를 사실상 멈췄다. 지금은 1밀리초 안쪽이라 1초는 넉넉한 상한이다.
+def test_split_station_name_is_linear_in_long_whitespace_runs():
+    name = "1. 가" + " " * 40_000 + "나"
+    started = time.perf_counter()
+    number, rest = load.split_station_name(name)
+    assert time.perf_counter() - started < 1.0
+    assert number == "1" and rest == "가" + " " * 40_000 + "나"
 
 
 # dim_stations만 있는 warehouse 파일. ST-1은 이름을 바꿔 다시 만들 수 있고, ST-2는
@@ -158,8 +188,9 @@ def test_realtime_rows_accept_integer_bike_counts(value, expected):
 
 # 비워도 되는(NULL 허용) 값이 이상하면 행은 남기고 그 값만 None으로 바꿔 센다: 거치대 수(스냅샷의
 # rack_count, 새 대여소의 docks)가 0 이상 int32 정수가 아님, 좌표가 유한한 숫자가 아님, 이름 앞
-# 대여소번호가 int32 초과, 이름이 varchar(200)보다 길거나 NUL 문자(PostgreSQL 문자열에 넣을 수
-# 없음)를 담음. 빈 값은 원래 결측이라 세지 않는다.
+# 대여소번호가 int32 초과(파이썬 int()가 거부하는 4,300자리 넘는 숫자 포함: 전에는 ValueError로 그
+# 파일 전체가 실패), 이름이 varchar(200)보다 길거나 NUL 문자(PostgreSQL 문자열에 넣을 수 없음)를
+# 담음. 빈 값은 원래 결측이라 세지 않는다.
 @pytest.mark.parametrize(
     "values, column",
     [
@@ -171,6 +202,8 @@ def test_realtime_rows_accept_integer_bike_counts(value, expected):
         ({"lon": "inf"}, "lon"),
         ({"lon": "1e400"}, "lon"),
         ({"station_name": "99999999999. 번호가 너무 큼"}, "station_no"),
+        ({"station_name": "2147483648. int32 상한 + 1"}, "station_no"),
+        ({"station_name": "9" * 5000 + ". 번호가 너무 긺"}, "station_no"),
         ({"station_name": "1. " + "가" * 201}, "station_name"),
         ({"station_name": "1. 이름\x00"}, "station_name"),
     ],
@@ -182,6 +215,25 @@ def test_realtime_rows_clear_only_the_value_that_cannot_be_stored(values, column
     assert snapshot["bike_count"] == 3
     assert station[column] is None
     assert snapshot["rack_count"] == (None if column == "docks" else 10)
+
+
+# 이름 앞 번호는 int32 범위 안이면 정수로 받는다: 앞의 0(원본 대여소번호는 '01653' 꼴)은 값에 영향이
+# 없고, 0이 4,300개 넘게 붙어도 int()의 자릿수 한도에 걸리지 않는다(전에는 이 경우도 ValueError).
+# int32 상한 그대로와 전각 숫자(int()와 같은 값)도 받는다.
+@pytest.mark.parametrize(
+    "name, number, rest",
+    [
+        ("01653. 노원역1번출구", 1653, "노원역1번출구"),
+        ("0" * 5000 + "7. 0이 많이 붙음", 7, "0이 많이 붙음"),
+        ("2147483647. int32 상한", 2_147_483_647, "int32 상한"),
+        ("１２. 전각 숫자", 12, "전각 숫자"),
+    ],
+)
+def test_realtime_rows_read_the_station_number_in_front_of_the_name(name, number, rest):
+    rows = load.realtime_rows([realtime_record(station_name=name)])
+    (station,) = rows.stations
+    assert (station["station_no"], station["station_name"]) == (number, rest)
+    assert (rows.skipped_rows, rows.nulled_values) == (0, 0)
 
 
 # 대여소ID가 비었거나, varchar(20)보다 길거나, NUL을 담으면 키로 쓸 수 없어 그 행을 건너뛰고

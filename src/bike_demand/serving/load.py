@@ -55,8 +55,12 @@ from bike_demand.serving.models import Prediction, RealtimeSnapshot, Station, We
 # 한 번에 보내는 행 수. 하루 스냅샷(대여소 약 2,700곳 × 수집 횟수)처럼 수십만 행을 한 문장으로
 # 보내지 않고 나눠 보내 한 번에 보내는 양을 제한한다.
 BATCH = 5000
-# 실시간 API의 대여소 이름은 "102. 망원역 1번출구 앞"처럼 번호가 앞에 붙는다.
-_NAME_WITH_NO = re.compile(r"^\s*(\d+)\.\s*(.*?)\s*$")
+# 실시간 API의 대여소 이름은 "102. 망원역 1번출구 앞"처럼 번호가 앞에 붙는다. 이 정규식은 앞
+# 공백과 번호·점까지만 찾고(re.match로 문자열 처음에 고정), 나머지 이름의 앞뒤 공백은
+# str.strip()으로 뗀다. 예전에는 한 정규식 `^\s*(\d+)\.\s*(.*?)\s*$`로 이름 끝 공백까지 맞췄는데,
+# `(.*?)\s*$`는 이름 가운데의 긴 공백에서 길이의 제곱에 비례해 느려졌다(공백 4만 개에 약 12초).
+# 나누는 결과는 예전과 같다(split_station_name 주석).
+_NAME_NUMBER = re.compile(r"\s*(\d+)\.")
 # DB 열이 받을 수 있는 범위(serving/models.py): integer 열의 상한, station_id varchar(20),
 # station_name varchar(200). 넘는 값을 그대로 보내면 PostgreSQL이 그 문장 전체를 거부한다.
 INT32_MAX = 2_147_483_647
@@ -99,6 +103,8 @@ def _insert_ignore(engine: Engine, table, rows: Iterable[dict], keys: list[str])
 # 'N/A'), float으로 무한·NaN이 되는 값('1e400', 'nan'), 소수부가 있는 값, 음수, 상한 초과는 모두
 # None이다. 전에는 int(float(value))가 '-'에서 ValueError, '1e400'에서 OverflowError를 내 파일 하나
 # 전체의 적재가 실패했다. 빈 값인지(원래 결측)와 잘못된 값인지는 호출하는 쪽이 원래 값으로 가린다.
+# 이름 앞 대여소번호(split_station_name의 숫자 문자열)도 같은 integer 열 규칙이라 이 함수로 바꾼다.
+# float은 int()와 달리 자릿수 한도가 없어 아주 긴 숫자도 예외 없이 무한대 → None이 된다.
 def _nonnegative_int(value: str | None) -> int | None:
     if value in (None, ""):
         return None
@@ -178,16 +184,27 @@ def load_stations_from_warehouse(engine: Engine, warehouse: Path) -> int:
     return len(rows)
 
 
-# 실시간 API의 대여소 이름 '102. 망원역 1번출구 앞'을 (102, '망원역 1번출구 앞')으로 나눈다. 번호가
-# 없는 이름은 (None, 앞뒤 공백을 뗀 이름), 빈 이름은 (None, None). 실시간에만 나오는 새 대여소의
-# station_no를 채우는 데 쓴다.
-def split_station_name(name: str | None) -> tuple[int | None, str | None]:
+# 실시간 API의 대여소 이름 '102. 망원역 1번출구 앞'을 ('102', '망원역 1번출구 앞')으로 나눈다.
+# 번호가 없는 이름은 (None, 앞뒤 공백을 뗀 이름), 빈 이름은 (None, None). 실시간에만 나오는 새
+# 대여소의 station_no를 채우는 데 쓴다.
+# - 번호는 숫자 문자열 그대로 돌려준다(앞의 0 포함). 정수로 바꾸고 DB 범위(int32)를 확인하는 일은
+#   realtime_rows가 다른 정수 값과 같은 규칙(_nonnegative_int)으로 한다. 여기서 int()를 부르면
+#   4,300자리를 넘는 숫자(앞의 0 포함)에서 파이썬이 ValueError를 내 그 파일 전체의 적재가
+#   실패했다.
+# - 나누는 규칙은 예전 정규식 `^\s*(\d+)\.\s*(.*?)\s*$`와 같다: 앞 공백 뒤의 숫자와 바로 뒤 점이
+#   번호, 나머지의 앞뒤 공백(줄바꿈 포함)을 뗀 것이 이름이다. 예전 `(.*?)`는 줄바꿈을 건너지
+#   못했으므로, 떼고 남은 이름 가운데에 줄바꿈이 있으면 번호가 없는 이름으로 본다. 정규식의 \s와
+#   str.strip()은 같은 유니코드 공백 정의(str.isspace)를 쓴다. tests/test_serving_load.py가 경계
+#   사례를 고정한다.
+def split_station_name(name: str | None) -> tuple[str | None, str | None]:
     if not name:
         return None, None
-    match = _NAME_WITH_NO.match(name)
-    if not match:
-        return None, name.strip()
-    return int(match.group(1)), match.group(2)
+    match = _NAME_NUMBER.match(name)
+    if match is not None:
+        rest = name[match.end() :].strip()
+        if "\n" not in rest:
+            return match.group(1), rest
+    return None, name.strip()
 
 
 # realtime_rows의 결과. snapshots는 realtime_snapshots에, stations는 stations에 넣을 행이다.
@@ -226,7 +243,12 @@ def realtime_rows(records: Iterable[dict]) -> RealtimeRows:
             continue
         rack_count = _nonnegative_int(r.get("rack_count"))
         lat, lon = _finite_float(r.get("lat")), _finite_float(r.get("lon"))
-        station_no, station_name = split_station_name(r.get("station_name"))
+        # 이름 앞 번호(숫자 문자열)도 station_no integer 열이라 개수와 같은 규칙으로 바꾼다: 0
+        # 이상 int32 상한 이하만 받고 넘으면 None. float을 거치므로 int()의 4,300자리 한도에
+        # 걸리지 않고, 아주 긴 숫자는 무한대가 되어 None이다. 숫자만으로 된 문자열이라 소수·음수는
+        # 나오지 않는다.
+        number, station_name = split_station_name(r.get("station_name"))
+        station_no = _nonnegative_int(number)
         # 넣을 수 없는 값만 비운다. 원래 값이 비어 있지 않았는데 None이 된 것만 센다.
         nulled += sum(
             parsed is None and raw not in (None, "")
@@ -234,10 +256,9 @@ def realtime_rows(records: Iterable[dict]) -> RealtimeRows:
                 (rack_count, r.get("rack_count")),
                 (lat, r.get("lat")),
                 (lon, r.get("lon")),
+                (station_no, number),
             )
         )
-        if station_no is not None and station_no > INT32_MAX:
-            station_no, nulled = None, nulled + 1
         if station_name is not None and not _storable_text(station_name, STATION_NAME_MAX):
             station_name, nulled = None, nulled + 1
         stations[station_id] = {
