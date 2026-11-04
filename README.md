@@ -27,6 +27,7 @@
 - 멈춘 동안의 실시간 스냅샷은 되살릴 수 없다. 지금 API를 띄우면 최근 스냅샷이 없어 `/shortage-risk`는 503(`no recent snapshot`)을 돌려준다
 - **다시 켜려면**: `.env`에 두 인증키를 넣고 `docker compose up -d db` → `docker compose --profile airflow up -d --build`. 컨테이너를 지우지 않았으면 DAG를 켠 상태도 남아 있다. 새로 만들면 DAG가 멈춘 상태로 생기므로 아래 '서비스 DB와 Airflow' 절처럼 `collect_realtime`·`forecast_and_predict`를 켜고, 예측에는 학습한 서비스 모델(`data/models/v1/serving/`)이 있어야 한다. 단기예보는 최근 24시간 안에 빠진 발표만 다시 받는다
 - 코드 검사는 GitHub Actions가 main push와 pull request마다 돌린다(Actions 화면에서 손으로도 돌릴 수 있다): `ruff check`·`ruff format --check`, `dbt parse`, PostgreSQL 서비스 컨테이너를 붙인 `pytest`(원본 데이터·인증키 없이 합성 자료로 돈다), 그리고 `uv.lock`에 고정된 패키지 판을 `pip-audit`로 PyPI의 공개 취약점 권고와 대조하는 작업(권고가 하나라도 있으면 실패)
+- (2026-11-05 확인) 같은 판 목록을 OSV 데이터베이스(`pip-audit -s osv`)와도 대조하면 mako 1.4.1에 권고 한 건(PYSEC-2026-4243, 별칭 CVE-2026-102991·GHSA-5639-2j2p-m4mx, 고친 판 1.4.2)이 나온다. Windows에서 `TemplateLookup`에 드라이브 문자로 시작하는 URI를 넘기면 템플릿 폴더 밖의 파일을 읽을 수 있다는 내용이고, PyPI의 권고 정보에는 아직 없어 위 CI 대조에는 걸리지 않는다. 이 프로젝트에서 mako는 alembic이 새 마이그레이션 파일을 만들 때(`alembic revision`, 저장소의 `alembic/script.py.mako`를 `Template(filename=...)`으로 채움)만 쓰이고 `TemplateLookup`은 쓰이지 않으므로(저장소 코드는 mako를 직접 쓰지 않고, 서비스와 `alembic upgrade`는 템플릿을 쓰지 않는다) 해당하지 않는다고 보고 판을 그대로 둔다
 
 ## 결과
 
