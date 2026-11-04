@@ -1,7 +1,9 @@
-# CI: push·pull request마다 린트, dbt 파싱, 전체 테스트(서비스 DB 테스트 포함)를 돌린다.
+# CI: push·pull request마다(Actions 화면에서 손으로도) 두 작업을 서로 기다리지 않고 나란히 돌린다.
+# - test: 린트, dbt 파싱, 전체 테스트(서비스 DB 테스트 포함)
+# - audit: uv.lock에 고정된 모든 패키지 판을 공개 취약점 권고와 대조한다(아래 audit 작업의 설명)
 # - 원본 대여이력·warehouse·인증키 없이 도는 검사만 넣었다. 테스트는 합성 자료(메모리 DuckDB, 임시
 #   폴더의 합성 bronze로 돌리는 dbt build, httpx 가짜 응답)와 아래 Postgres 서비스의 임시 DB만 쓴다.
-# - 로컬에서 같은 검사를 돌리는 방법은 README '실행' 절의 테스트 줄과 같다(DB는 docker compose의 db).
+# - test 작업의 검사를 로컬에서 돌리는 방법은 README '실행' 절의 테스트 줄과 같다(DB는 docker compose의 db).
 
 name: CI
 
@@ -9,6 +11,17 @@ on:
   push:
     branches: [main]
   pull_request:
+  # 손으로 실행(Actions 화면의 'Run workflow' 또는 `gh workflow run ci.yml`). 코드가 그대로여도 그 뒤에 공개된
+  # 취약점 권고를 확인하고 싶을 때 push 없이 test·audit를 다시 돌린다. 같은 브랜치에서 돌던 실행은 아래
+  # concurrency 설정대로 취소된다. 주기 실행(schedule)은 공개 저장소에 정기 실행과 실패 알림을 만드는 지속
+  # 설정이라 넣지 않았다.
+  workflow_dispatch:
+
+# GITHUB_TOKEN에는 저장소 내용 읽기 권한만 준다. 적지 않으면 저장소 설정의 기본 권한(설정에 따라 쓰기 포함)으로
+# 돌고, 그 설정은 이 파일 밖에 있어 바뀌어도 여기서는 보이지 않는다. 한 범위라도 적으면 적지 않은 범위는 모두
+# 권한 없음이 된다(metadata 읽기는 늘 있다). 두 작업은 코드를 받아 검사만 하고 저장소에 아무것도 쓰지 않는다.
+permissions:
+  contents: read
 
 # 같은 브랜치에 새 push가 오면 앞선 실행을 취소한다(결과를 볼 일이 없는 실행에 시간을 쓰지 않음).
 concurrency:
@@ -50,10 +63,22 @@ jobs:
       DBT_SEND_ANONYMOUS_USAGE_STATS: "false"
 
     steps:
-      - uses: actions/checkout@v7
+      # 외부 액션은 태그가 아니라 전체 커밋 SHA로 고정하고, 줄 끝 주석에 그 SHA의 릴리스 태그를 적는다. 태그는
+      # 액션 저장소 쪽에서 다른 커밋으로 옮길 수 있어(actions/checkout의 v7 같은 주 버전 태그는 새 v7.x 릴리스마다
+      # 옮겨진다) 이 파일이 그대로여도 다른 코드가 돌 수 있지만, 커밋 SHA는 옮길 수 없다. 두 SHA는 태그로 적었던
+      # 마지막 CI 실행(2026-10-19)이 실제로 받은 커밋과 같다(2026-11-05 확인: v7 = v7.0.1). 자동 갱신 도구는 쓰지
+      # 않으므로 판을 올릴 때는 손으로 바꾼다: `gh api repos/<owner>/<repo>/git/ref/tags/<태그>`의 object.sha를
+      # 쓰되, object.type이 tag(주석 달린 태그)이면 `gh api repos/<owner>/<repo>/git/tags/<그 sha>`로 한 번 더
+      # 따라가 커밋 SHA를 얻고, SHA와 판 주석을 함께 바꾼다(audit 작업도 같은 값으로).
+      # persist-credentials: false는 checkout이 끝난 뒤 GITHUB_TOKEN을 .git/config의 인증 설정에 남기지 않는다.
+      # 뒤 단계는 원격 저장소에 접근하지 않아 토큰이 필요 없고, 테스트나 받아 쓰는 도구가 그 설정을 읽을 일이
+      # 없게 한다.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       # setup-uv는 v8부터 v10 같은 주 버전 태그를 내지 않아 정확한 릴리스로 고정한다.
-      - uses: astral-sh/setup-uv@v10.2.0
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
         with:
           enable-cache: true
 
@@ -77,3 +102,57 @@ jobs:
       # 테스트는 없어야 한다). tests/test_dbt_calendar_end.py가 합성 자료로 dbt build 전체도 돌린다.
       - name: Test
         run: uv run --no-sync pytest -q -rs
+
+  # 공개 취약점 권고 대조. uv.lock에 고정된 모든 패키지(본체 의존성과 dev 그룹, 모든 플랫폼·모든 파이썬 갈래)의
+  # 판을 PyPI의 권고 정보(pip-audit 기본)와 대조하고, 권고가 하나라도 있으면 실패한다(continue-on-error를 두지
+  # 않은 막는 검사). 코드가 바뀌지 않아도 새로 공개된 권고를 push·PR 때(또는 손으로 돌릴 때) 바로 알기 위해 둔다.
+  # - 패키지를 설치하지 않고(--disable-pip, --no-deps) uv export로 뽑은 `이름==판`만 조회한다. 프로젝트 자신은
+  #   PyPI에 없으므로 내보내지 않는다(--no-emit-project).
+  # - 환경 표시(`; python_full_version < '3.12'`, `; sys_platform == 'win32'` 등)를 뗀다. 그대로 두면 pip-audit가
+  #   자기를 돌리는 해석기 기준으로 표시를 판정해 맞지 않는 줄은 대조하지 않는다. 예를 들어 Windows의 Python 3.12로
+  #   돌리면 이 프로젝트가 실제로 쓰는 python 3.11 갈래의 numpy·scipy 판과 Windows 밖에서만 쓰는 uvloop이 빠진다
+  #   (2026-11-05 확인). 떼면 어느 러너·해석기에서 돌려도 같은 목록을 본다.
+  # - 같은 이름이 판을 달리해 또 나오면(numpy·scipy가 python 3.11과 3.12 이상에서 다른 판) pip-audit가 한 목록 안의
+  #   같은 이름을 받지 않으므로(duplicate requirements 오류), 둘째부터는 다음 목록(audit-2.txt …)으로 나눠 따로
+  #   대조한다.
+  # - --strict는 대조하지 못한 패키지가 하나라도 있으면 실패하게 해, 조용히 빠지는 패키지가 없게 한다.
+  # - 고친 판이 없어 받아들이기로 한 권고가 생기면 `--ignore-vuln <ID>`를 이유 주석과 함께 여기에 더한다(지금은
+  #   없음). OSV(-s osv)는 대조하지 않는다. 이 검사의 기준은 PyPI의 권고 정보이고, OSV에만 있는 권고는 따로 보고
+  #   판단한다.
+  # - pip-audit 판은 고정한다(2.10.1). 결과 표는 이 단계의 로그에 남는다.
+  # - 로컬에서 같은 대조를 하려면 아래 run의 명령을 Git Bash에서 RUNNER_TEMP만 빈 임시 폴더로 정해 그대로 돌린다.
+  audit:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      # 액션 SHA 고정과 persist-credentials는 test 작업과 같은 이유다(그쪽 주석).
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # 캐시를 쓰지 않는다. setup-uv의 캐시 키는 러너 OS·해석기 판·의존성 파일(pyproject.toml·uv.lock) 해시로
+      # 정해져 test 작업과 같은 키가 되는데, 이 작업이 먼저 끝나 pip-audit만 든 캐시를 저장하면 test 작업은 같은
+      # 키로 저장하지 못하고 다음 실행부터 그 캐시를 받게 된다. 이 작업이 받는 것은 pip-audit 하나라 캐시 이득도
+      # 작다.
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          enable-cache: false
+
+      # shell: bash를 적으면 `bash -eo pipefail`로 돈다(적지 않은 기본 셸은 `bash -e`뿐이라 파이프 앞쪽 명령이
+      # 실패해도 지나간다). 그래서 내보내기 실패(-e)뿐 아니라 grep이 한 줄도 고르지 못한 경우(pipefail)도 이
+      # 단계를 실패시켜, 빈 목록을 대조하고 통과하는 일이 없다.
+      - name: Audit locked dependencies
+        shell: bash
+        run: |
+          uv export --frozen --format requirements-txt --no-hashes --no-emit-project > "$RUNNER_TEMP/locked.txt"
+          grep -E '^[A-Za-z0-9]' "$RUNNER_TEMP/locked.txt" | sed -E 's/[[:space:]]*;.*$//' > "$RUNNER_TEMP/pinned.txt"
+          awk -F'==' -v dir="$RUNNER_TEMP" '{
+            name = tolower($1); gsub(/[-_.]+/, "-", name)
+            print > (dir "/audit-" (++seen[name]) ".txt")
+          }' "$RUNNER_TEMP/pinned.txt"
+          status=0
+          for list in "$RUNNER_TEMP"/audit-*.txt; do
+            echo "== $(basename "$list"): $(wc -l < "$list") packages"
+            uvx pip-audit@2.10.1 -r "$list" --no-deps --disable-pip --strict --progress-spinner off || status=1
+          done
+          exit "$status"

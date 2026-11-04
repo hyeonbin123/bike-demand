@@ -26,7 +26,7 @@
 - **프로젝트는 끝났고 수집은 멈춰 있다.** 2026-10-03에 Airflow·DB 컨테이너를 멈춘 뒤로 실시간 대여정보·단기예보 수집과 예측이 돌지 않는다. 아래 '결과'의 측정 값은 그대로다
 - 멈춘 동안의 실시간 스냅샷은 되살릴 수 없다. 지금 API를 띄우면 최근 스냅샷이 없어 `/shortage-risk`는 503(`no recent snapshot`)을 돌려준다
 - **다시 켜려면**: `.env`에 두 인증키를 넣고 `docker compose up -d db` → `docker compose --profile airflow up -d --build`. 컨테이너를 지우지 않았으면 DAG를 켠 상태도 남아 있다. 새로 만들면 DAG가 멈춘 상태로 생기므로 아래 '서비스 DB와 Airflow' 절처럼 `collect_realtime`·`forecast_and_predict`를 켜고, 예측에는 학습한 서비스 모델(`data/models/v1/serving/`)이 있어야 한다. 단기예보는 최근 24시간 안에 빠진 발표만 다시 받는다
-- 코드 검사는 GitHub Actions가 main push와 pull request마다 돌린다: `ruff check`·`ruff format --check`, `dbt parse`, PostgreSQL 서비스 컨테이너를 붙인 `pytest`(원본 데이터·인증키 없이 합성 자료로 돈다)
+- 코드 검사는 GitHub Actions가 main push와 pull request마다 돌린다(Actions 화면에서 손으로도 돌릴 수 있다): `ruff check`·`ruff format --check`, `dbt parse`, PostgreSQL 서비스 컨테이너를 붙인 `pytest`(원본 데이터·인증키 없이 합성 자료로 돈다), 그리고 `uv.lock`에 고정된 패키지 판을 `pip-audit`로 PyPI의 공개 취약점 권고와 대조하는 작업(권고가 하나라도 있으면 실패)
 
 ## 결과
 
