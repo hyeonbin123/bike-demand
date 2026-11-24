@@ -27,10 +27,16 @@ ENV UV_PROJECT_ENVIRONMENT=/opt/bike/.venv \
     UV_LINK_MODE=copy \
     UV_PYTHON_DOWNLOADS=never
 # Airflow 이미지는 VIRTUAL_ENV를 자기 환경으로 잡아 두므로 uv를 부를 때만 뺀다
+#
+# uv는 위에서 가져온 /usr/local/bin/uv를 경로째로 부른다. 기본 이미지의 airflow 사용자는 PATH에서
+# /home/airflow/.local/bin이 /usr/local/bin보다 앞이고 거기에 기본 이미지가 넣어 둔 다른 판의 uv가 있어,
+# 이름만 쓰면 그쪽이 실행된다(3.3.2 이미지에서는 0.12.10). 2026-11-24에 고쳤다: 그 전에는 이름만 써서
+# 위에서 고른 판이 설치에 쓰이지 않았다. 어느 uv가 환경을 만들었는지는 만들어진 이미지의
+# /opt/bike/.venv/pyvenv.cfg에 있는 `uv = <판>` 줄로 확인한다.
 COPY --chown=airflow:0 pyproject.toml uv.lock README.md ./
-RUN env -u VIRTUAL_ENV uv sync --frozen --no-dev --no-install-project --python python3.11
+RUN env -u VIRTUAL_ENV /usr/local/bin/uv sync --frozen --no-dev --no-install-project --python python3.11
 COPY --chown=airflow:0 src ./src
 COPY --chown=airflow:0 dbt ./dbt
-RUN env -u VIRTUAL_ENV uv sync --frozen --no-dev --python python3.11
+RUN env -u VIRTUAL_ENV /usr/local/bin/uv sync --frozen --no-dev --python python3.11
 
 WORKDIR /opt/airflow
