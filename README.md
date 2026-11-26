@@ -79,6 +79,12 @@ flowchart LR
     ML --> PG[("PostgreSQL<br/>서비스용")]
     RT["실시간 대여정보<br/>단기예보"] --> PG
     PG --> API["FastAPI·대시보드"]
+    %% GitHub가 그림 오른쪽 아래에 늘 띄우는 확대·이동 버튼이 마지막 상자를 가리지 않게, 보이지 않는 빈 칸 둘을 오른쪽에 둔다.
+    padA[" "]
+    padB[" "]
+    API ~~~ padA ~~~ padB
+    classDef blank fill:none,stroke:none
+    class padA,padB blank
 ```
 
 ## 스택
